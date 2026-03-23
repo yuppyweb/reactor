@@ -1,0 +1,32 @@
+version: '3'
+
+tasks:
+  fix:
+    cmds:
+      - golangci-lint run --fix --color=always 
+    desc: Automatically fix linting issues
+
+  lint:
+    cmds:
+      - golangci-lint run --color=always
+    desc: Run golangci-lint on the codebase
+
+  test:
+    cmds:
+      - go test --count=1 -v -coverprofile cover.out ./...
+      - go tool cover -html cover.out -o cover.html
+      - go tool cover -func cover.out
+      - rm cover.out
+    desc: Run tests with coverage
+    ignore_error: true
+
+  test-100:
+    cmds:
+      - go test --count=100 -failfast ./...
+    desc: Run tests 100 times to catch flakiness
+
+  vuln:
+    cmds:
+      - govulncheck -show=color -test ./...
+    desc: Run Go vulnerability checker
+    
