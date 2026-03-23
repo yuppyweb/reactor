@@ -24,10 +24,11 @@ type mockWorker struct {
 var _ reactor.Worker = (*mockWorker)(nil)
 
 func (w *mockWorker) Start(ctx context.Context) {
+	defer close(w.errCh)
+
 	w.startCtx.Store(ctx)
 	w.countStartCalls.Add(1)
 	time.Sleep(w.timeLifeStarted)
-	close(w.errCh)
 }
 
 func (w *mockWorker) Shutdown(ctx context.Context) {
@@ -42,6 +43,8 @@ func (w *mockWorker) Errors() <-chan error {
 
 type testKey struct{}
 
+// TestReactor_NewWithNilWorker verifies that New() returns ErrWorkerIsNil
+// when attempting to add a nil worker.
 func TestReactor_NewWithNilWorker(t *testing.T) {
 	t.Parallel()
 
@@ -51,6 +54,8 @@ func TestReactor_NewWithNilWorker(t *testing.T) {
 	}
 }
 
+// TestReactor_StartOnce verifies that Start() can only be called once.
+// The second call should be a no-op and no errors should be sent.
 func TestReactor_StartOnce(t *testing.T) {
 	t.Parallel()
 
@@ -105,6 +110,8 @@ func TestReactor_StartOnce(t *testing.T) {
 	}
 }
 
+// TestReactor_StartIsStarted verifies that calling Start() while the first Start() is running
+// is a no-op and does not launch the worker again.
 func TestReactor_StartIsStarted(t *testing.T) {
 	t.Parallel()
 
@@ -155,6 +162,8 @@ func TestReactor_StartIsStarted(t *testing.T) {
 	}
 }
 
+// TestReactor_StartWithoutWorkers verifies that Start() works correctly
+// with no workers and properly closes the error channel.
 func TestReactor_StartWithoutWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -179,6 +188,8 @@ func TestReactor_StartWithoutWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_StartSingleShortWorker verifies launching a single fast worker
+// and proper error channel closure.
 func TestReactor_StartSingleShortWorker(t *testing.T) {
 	t.Parallel()
 
@@ -211,6 +222,8 @@ func TestReactor_StartSingleShortWorker(t *testing.T) {
 	}
 }
 
+// TestReactor_StartSingleShortWorkerWithError verifies that worker errors
+// are properly forwarded to the reactor's error channel.
 func TestReactor_StartSingleShortWorkerWithError(t *testing.T) {
 	t.Parallel()
 
@@ -251,6 +264,8 @@ func TestReactor_StartSingleShortWorkerWithError(t *testing.T) {
 	}
 }
 
+// TestReactor_StartSingleShortWorkerWithManyErrors verifies that multiple errors
+// from a single worker are collected correctly based on buffer size.
 func TestReactor_StartSingleShortWorkerWithManyErrors(t *testing.T) {
 	t.Parallel()
 
@@ -293,6 +308,8 @@ func TestReactor_StartSingleShortWorkerWithManyErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_StartMultipleShortWorkers verifies concurrent launching of multiple
+// fast workers and proper error channel closure.
 func TestReactor_StartMultipleShortWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -332,6 +349,8 @@ func TestReactor_StartMultipleShortWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_StartMultipleShortWorkersWithErrors verifies that errors from multiple
+// workers are properly aggregated into a single error channel.
 func TestReactor_StartMultipleShortWorkersWithErrors(t *testing.T) {
 	t.Parallel()
 
@@ -382,6 +401,8 @@ func TestReactor_StartMultipleShortWorkersWithErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_StartMultipleShortWorkersWithManyErrors verifies that multiple errors
+// from several workers are properly collected and forwarded through the error channel.
 func TestReactor_StartMultipleShortWorkersWithManyErrors(t *testing.T) {
 	t.Parallel()
 
@@ -430,6 +451,8 @@ func TestReactor_StartMultipleShortWorkersWithManyErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_StartSingleLongWorker verifies launching a long-running worker
+// with proper handling and blocking of Start().
 func TestReactor_StartSingleLongWorker(t *testing.T) {
 	t.Parallel()
 
@@ -472,6 +495,8 @@ func TestReactor_StartSingleLongWorker(t *testing.T) {
 	}
 }
 
+// TestReactor_StartSingleLongWorkerWithError verifies that errors from a long-running worker
+// are properly forwarded to the error channel during execution.
 func TestReactor_StartSingleLongWorkerWithError(t *testing.T) {
 	t.Parallel()
 
@@ -518,6 +543,8 @@ func TestReactor_StartSingleLongWorkerWithError(t *testing.T) {
 	}
 }
 
+// TestReactor_StartSingleLongWorkerWithManyErrors verifies that multiple errors
+// from a long-running worker are properly forwarded and all errors reach the reader.
 func TestReactor_StartSingleLongWorkerWithManyErrors(t *testing.T) {
 	t.Parallel()
 
@@ -540,8 +567,10 @@ func TestReactor_StartSingleLongWorkerWithManyErrors(t *testing.T) {
 		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
 	}
 
-	var countWriteErr atomic.Int32
-	var countReadErr atomic.Int32
+	var (
+		countWriteErr atomic.Int32
+		countReadErr  atomic.Int32
+	)
 
 	go rc.Start(ctx)
 
@@ -589,6 +618,8 @@ func TestReactor_StartSingleLongWorkerWithManyErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_StartMultipleLongWorkers verifies concurrent launching of multiple
+// long-running workers with different execution durations.
 func TestReactor_StartMultipleLongWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -639,6 +670,8 @@ func TestReactor_StartMultipleLongWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_StartMultipleLongWorkersWithErrors verifies that errors from multiple
+// long-running workers are properly aggregated into a single error channel.
 func TestReactor_StartMultipleLongWorkersWithErrors(t *testing.T) {
 	t.Parallel()
 
@@ -715,6 +748,8 @@ func TestReactor_StartMultipleLongWorkersWithErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_StartMultipleLongWorkersWithManyErrors verifies that multiple errors
+// from several long-running workers are properly collected in parallel.
 func TestReactor_StartMultipleLongWorkersWithManyErrors(t *testing.T) {
 	t.Parallel()
 
@@ -811,6 +846,8 @@ func TestReactor_StartMultipleLongWorkersWithManyErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownWithoutStart verifies that calling Shutdown() without Start()
+// is a safe no-op and does not invoke Shutdown on workers.
 func TestReactor_ShutdownWithoutStart(t *testing.T) {
 	t.Parallel()
 
@@ -838,6 +875,8 @@ func TestReactor_ShutdownWithoutStart(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownAfterStart verifies that Shutdown() after Start() completes
+// does not invoke Shutdown on workers since they are already stopped.
 func TestReactor_ShutdownAfterStart(t *testing.T) {
 	t.Parallel()
 
@@ -873,6 +912,8 @@ func TestReactor_ShutdownAfterStart(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownOnce verifies that Shutdown() can only be called once
+// and subsequent calls are no-ops thanks to sync.Once.
 func TestReactor_ShutdownOnce(t *testing.T) {
 	t.Parallel()
 
@@ -910,6 +951,8 @@ func TestReactor_ShutdownOnce(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownOnceConcurrent verifies that concurrent Shutdown() calls
+// are properly handled with only the first call executing worker shutdown.
 func TestReactor_ShutdownOnceConcurrent(t *testing.T) {
 	t.Parallel()
 
@@ -960,6 +1003,8 @@ func TestReactor_ShutdownOnceConcurrent(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownSingleLongWorker verifies graceful shutdown of a long-running worker
+// and that Shutdown() properly waits for worker.Shutdown() completion.
 func TestReactor_ShutdownSingleLongWorker(t *testing.T) {
 	t.Parallel()
 
@@ -1002,6 +1047,8 @@ func TestReactor_ShutdownSingleLongWorker(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownMultipleLongWorkers verifies concurrent shutdown of multiple
+// long-running workers and that Shutdown() waits for the slowest one.
 func TestReactor_ShutdownMultipleLongWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -1057,6 +1104,8 @@ func TestReactor_ShutdownMultipleLongWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_ShutdownWithCancelledContext verifies that Shutdown() properly handles
+// the case when the context is cancelled before workers complete shutdown.
 func TestReactor_ShutdownWithCancelledContext(t *testing.T) {
 	t.Parallel()
 
@@ -1090,6 +1139,8 @@ func TestReactor_ShutdownWithCancelledContext(t *testing.T) {
 	}
 }
 
+// TestReactor_NestedReactors verifies that Reactor can be used as a Worker
+// and allows creating hierarchical reactor structures.
 func TestReactor_NestedReactors(t *testing.T) {
 	t.Parallel()
 
@@ -1218,6 +1269,8 @@ func TestReactor_NestedReactors(t *testing.T) {
 	}
 }
 
+// TestReactor_ManyWorkers verifies scalability with launching and proper handling
+// of 100 workers with error aggregation into a single channel.
 func TestReactor_ManyWorkers(t *testing.T) {
 	t.Parallel()
 
