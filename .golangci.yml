@@ -131,6 +131,7 @@ linters:
           - err113
           - cyclop
           - funlen
+          - containedctx
         path: _test.go
     paths:
       - third_party
