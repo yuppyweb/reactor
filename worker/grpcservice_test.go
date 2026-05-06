@@ -38,6 +38,9 @@ func (m *mockGRPCServer) GracefulStop() {
 }
 
 // Ensure mockGRPCServer implements the GRPCServer interface.
+var _ worker.GRPCServer = (*mockGRPCServer)(nil)
+
+// Ensure mockGRPCServer implements the GRPCServer interface.
 func TestGRPCService_Start(t *testing.T) {
 	t.Parallel()
 
@@ -70,9 +73,9 @@ func TestGRPCService_Start(t *testing.T) {
 	}
 }
 
-// TestGRPCService_StartWithServeError verifies that if the Serve method returns an error,
+// TestGRPCService_Start_WithServeError verifies that if the Serve method returns an error,
 // it is properly wrapped and returned by the Start method.
-func TestGRPCService_StartWithServeError(t *testing.T) {
+func TestGRPCService_Start_WithServeError(t *testing.T) {
 	t.Parallel()
 
 	expectedErr := errors.New("serve error")
@@ -165,9 +168,9 @@ func TestGRPCService_Errors(t *testing.T) {
 	}
 }
 
-// TestGRPCService_StartInReactor verifies that the GRPCService can be started and stopped within a reactor,
+// TestGRPCService_Start_InReactor verifies that the GRPCService can be started and stopped within a reactor,
 // and that the Serve and GracefulStop methods are called appropriately.
-func TestGRPCService_StartInReactor(t *testing.T) {
+func TestGRPCService_Start_InReactor(t *testing.T) {
 	t.Parallel()
 
 	mockSrv := new(mockGRPCServer)

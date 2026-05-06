@@ -64,6 +64,7 @@ const (
 var (
 	ErrNilOption    = errors.New(packageName + ": option cannot be nil")
 	ErrNilWorker    = errors.New(packageName + ": worker is nil")
+	ErrNoWorkers    = errors.New(packageName + ": no workers added to reactor")
 	ErrNotRestart   = errors.New(packageName + ": restart is not possible")
 	ErrIsStarted    = errors.New(packageName + ": is already started")
 	ErrNotStarted   = errors.New(packageName + ": is not started")
@@ -119,8 +120,9 @@ type Reactor struct {
 	workers   []Worker
 	isStarted atomic.Bool
 	isStopped atomic.Bool
+	isSending atomic.Bool
 	errCh     chan error
-	errDoneCh chan error
+	errFullCh chan struct{}
 	mu        sync.Mutex
 	log       Logger
 }
@@ -131,7 +133,7 @@ func New(options ...Option) (*Reactor, error) {
 	reactor := new(Reactor)
 	reactor.workers = make([]Worker, 0)
 	reactor.errCh = make(chan error, defaultErrorBufferSize)
-	reactor.errDoneCh = make(chan error, 1)
+	reactor.errFullCh = make(chan struct{})
 	reactor.log = NewNopLogger()
 
 	for _, option := range options {
@@ -189,19 +191,17 @@ func (r *Reactor) Add(worker Worker) error {
 // return ErrChannelFull instead of blocking goroutines. The caller is responsible for
 // reading errors concurrently and ensuring sufficient error channel buffer capacity.
 func (r *Reactor) Start(ctx context.Context) error {
+	if len(r.workers) == 0 {
+		return ErrNoWorkers
+	}
+
 	if !r.isStarted.CompareAndSwap(false, true) {
 		return ErrNotRestart
 	}
 
-	defer func() {
-		r.mu.Lock()
+	defer r.stop()
 
-		r.isStopped.Store(true)
-		close(r.errCh)
-		close(r.errDoneCh)
-
-		r.mu.Unlock()
-	}()
+	r.isSending.Store(true)
 
 	wg := sync.WaitGroup{}
 	done := make(chan struct{})
@@ -241,8 +241,8 @@ func (r *Reactor) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		r.log.Debug(ctx, packageName+": workers startup cancelled by context")
 
-	case err := <-r.errDoneCh:
-		return err
+	case <-r.errFullCh:
+		return ErrChannelFull
 	}
 
 	return nil
@@ -287,8 +287,8 @@ func (r *Reactor) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		r.log.Debug(ctx, packageName+": workers shutdown cancelled by context")
 
-	case err := <-r.errDoneCh:
-		return err
+	case <-r.errFullCh:
+		return ErrChannelFull
 	}
 
 	return nil
@@ -313,20 +313,29 @@ func (r *Reactor) sendError(ctx context.Context, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.isStopped.Load() {
+	if !r.isSending.Load() {
 		return
 	}
 
 	select {
 	case r.errCh <- err:
 	default:
-		select {
-		case r.errDoneCh <- ErrChannelFull:
-		default:
-		}
+		r.isSending.Store(false)
+		close(r.errFullCh)
 
 		r.log.Error(ctx, fmt.Errorf("%w: %w", ErrFailedToSend, err))
 	}
+}
+
+// stop marks the reactor as stopped, stops error sending, and closes the error channel.
+// This method is protected by a mutex to ensure thread-safe access to the channels.
+func (r *Reactor) stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.isStopped.Store(true)
+	r.isSending.Store(false)
+	close(r.errCh)
 }
 
 // Ensure Reactor implements the Worker interface.

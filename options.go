@@ -2,7 +2,7 @@ package reactor
 
 import (
 	"errors"
-	"strconv"
+	"fmt"
 )
 
 const (
@@ -16,16 +16,12 @@ const (
 var (
 	ErrNilLogger = errors.New(packageName + ": logger cannot be nil")
 
-	ErrMinErrorBufferSize = errors.New(
-		packageName + ": error buffer size cannot be less than " + strconv.Itoa(
-			minErrorBufferSize,
-		),
+	ErrMinErrorBufferSize = fmt.Errorf(
+		packageName+": error buffer size cannot be less than %d", minErrorBufferSize,
 	)
 
-	ErrMaxErrorBufferSize = errors.New(
-		packageName + ": error buffer size cannot be greater than " + strconv.Itoa(
-			maxErrorBufferSize,
-		),
+	ErrMaxErrorBufferSize = fmt.Errorf(
+		packageName+": error buffer size cannot be greater than %d", maxErrorBufferSize,
 	)
 )
 

@@ -12,6 +12,7 @@ import (
 	"github.com/yuppyweb/reactor/worker"
 )
 
+// mockHTTPServer is a simple implementation of the HTTPServer interface for testing purposes.
 type mockHTTPServer struct {
 	listenAndServeCalled bool
 	listenAndServeErr    error
@@ -21,14 +22,17 @@ type mockHTTPServer struct {
 	shutdownErr          error
 }
 
+// ListenAndServe simulates serving HTTP requests
+// and can be configured to return an error or take a certain amount of time.
 func (m *mockHTTPServer) ListenAndServe() error {
 	m.listenAndServeCalled = true
-
 	time.Sleep(m.listenAndServeTime)
 
 	return m.listenAndServeErr
 }
 
+// Shutdown simulates gracefully stopping the HTTP server
+// and records that it was called along with the context.
 func (m *mockHTTPServer) Shutdown(ctx context.Context) error {
 	m.shutdownCalled = true
 	m.shutdownCtx = ctx
@@ -36,6 +40,11 @@ func (m *mockHTTPServer) Shutdown(ctx context.Context) error {
 	return m.shutdownErr
 }
 
+// Ensure mockHTTPServer implements the HTTPServer interface.
+var _ worker.HTTPServer = (*mockHTTPServer)(nil)
+
+// TestHTTPService_Start verifies that the HTTPService's Start method calls ListenAndServe
+// on the underlying HTTP server and handles errors correctly.
 func TestHTTPService_Start(t *testing.T) {
 	t.Parallel()
 
@@ -57,7 +66,9 @@ func TestHTTPService_Start(t *testing.T) {
 	}
 }
 
-func TestHTTPService_StartWithListenAndServeError(t *testing.T) {
+// TestHTTPService_Start_WithListenAndServeError verifies that if the ListenAndServe method returns an error,
+// it is properly wrapped and returned by the Start method.
+func TestHTTPService_Start_WithListenAndServeError(t *testing.T) {
 	t.Parallel()
 
 	expectedErr := errors.New("listen error")
@@ -89,6 +100,8 @@ func TestHTTPService_StartWithListenAndServeError(t *testing.T) {
 	}
 }
 
+// TestHTTPService_Shutdown verifies that the HTTPService's Shutdown method calls Shutdown
+// on the underlying HTTP server and handles errors correctly.
 func TestHTTPService_Shutdown(t *testing.T) {
 	t.Parallel()
 
@@ -117,7 +130,9 @@ func TestHTTPService_Shutdown(t *testing.T) {
 	}
 }
 
-func TestHTTPService_ShutdownWithError(t *testing.T) {
+// TestHTTPService_Shutdown_WithError verifies that if the Shutdown method returns an error,
+// it is properly wrapped and returned by the Shutdown method.
+func TestHTTPService_Shutdown_WithError(t *testing.T) {
 	t.Parallel()
 
 	type ctxTestKey struct{}
@@ -155,6 +170,7 @@ func TestHTTPService_ShutdownWithError(t *testing.T) {
 	}
 }
 
+// TestHTTPService_Errors verifies that the Errors method of HTTPService returns nil as expected.
 func TestHTTPService_Errors(t *testing.T) {
 	t.Parallel()
 
@@ -167,7 +183,9 @@ func TestHTTPService_Errors(t *testing.T) {
 	}
 }
 
-func TestHTTPService_StartInReactor(t *testing.T) {
+// TestHTTPService_Start_InReactor verifies that the HTTPService can be started and stopped within a reactor,
+// and that the ListenAndServe and Shutdown methods are called appropriately.
+func TestHTTPService_Start_InReactor(t *testing.T) {
 	t.Parallel()
 
 	type ctxTestKey struct{}
