@@ -30,7 +30,7 @@ type mockLogger struct {
 	errorLog []mockErrorLog
 }
 
-// NewMockLogger creates a new instance of mockLogger.
+// Debug logs a debug message to the mockLogger.
 func (m *mockLogger) Debug(ctx context.Context, msg string, args ...any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -57,7 +57,8 @@ func (m *mockLogger) Error(ctx context.Context, err error, args ...any) {
 // Ensure mockLogger implements the reactor.Logger interface.
 var _ reactor.Logger = (*mockLogger)(nil)
 
-// TestNopLogger verifies that the NopLogger can be used without panicking and that it implements the Logger interface.
+// TestNopLogger verifies that the NopLogger can be used without panicking and
+// that it implements the Logger interface.
 func TestNopLogger(t *testing.T) {
 	t.Parallel()
 
