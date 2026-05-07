@@ -3,6 +3,7 @@ package reactor_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,1336 +19,2317 @@ type mockWorker struct {
 	countShutdownCalls atomic.Int32
 	timeLifeStarted    time.Duration
 	timeLifeShutdown   time.Duration
+	startErr           error
+	shutdownErr        error
 	errCh              chan error
 }
 
 var _ reactor.Worker = (*mockWorker)(nil)
 
-func (w *mockWorker) Start(ctx context.Context) {
-	defer close(w.errCh)
+func (w *mockWorker) Start(ctx context.Context) error {
+	defer func() {
+		if w.errCh != nil {
+			close(w.errCh)
+		}
+	}()
 
 	w.startCtx.Store(ctx)
 	w.countStartCalls.Add(1)
 	time.Sleep(w.timeLifeStarted)
+
+	return w.startErr
 }
 
-func (w *mockWorker) Shutdown(ctx context.Context) {
+func (w *mockWorker) Shutdown(ctx context.Context) error {
 	w.shutdownCtx.Store(ctx)
 	w.countShutdownCalls.Add(1)
 	time.Sleep(w.timeLifeShutdown)
+
+	return w.shutdownErr
 }
 
 func (w *mockWorker) Errors() <-chan error {
 	return w.errCh
 }
 
-type testKey struct{}
+type mockFnWorker struct {
+	errFn func(chan error)
+	errCh chan error
+}
 
-// TestReactor_NewWithNilWorker verifies that New() returns ErrWorkerIsNil
-// when attempting to add a nil worker.
-func TestReactor_NewWithNilWorker(t *testing.T) {
+var _ reactor.Worker = (*mockFnWorker)(nil)
+
+func (w *mockFnWorker) Start(context.Context) error {
+	defer func() {
+		if w.errCh != nil {
+			close(w.errCh)
+		}
+	}()
+
+	if w.errFn != nil {
+		w.errFn(w.errCh)
+	}
+
+	return nil
+}
+
+func (w *mockFnWorker) Shutdown(context.Context) error {
+	return nil
+}
+
+func (w *mockFnWorker) Errors() <-chan error {
+	return w.errCh
+}
+
+func TestNewReactor_WithDefaultErrorBufferSize(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
+	}
+
+	if cap(react.Errors()) != 1000 {
+		t.Fatalf("expected error channel buffer size of 1000, got %d", cap(react.Errors()))
+	}
+}
+
+func TestNewReactor_WithCustomErrorBufferSize(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		bufferSize int
+	}{
+		{"BufferSize1", 1},
+		{"BufferSize10", 10},
+		{"BufferSize100", 100},
+		{"BufferSize1000", 1000},
+		{"BufferSize5000", 5000},
+		{"BufferSize10000", 10000},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			react, err := reactor.New(reactor.WithErrorBufferSize(tc.bufferSize))
+			if err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+
+			if react == nil {
+				t.Fatal("expected non-nil reactor, got nil")
+			}
+
+			if cap(react.Errors()) != tc.bufferSize {
+				t.Fatalf(
+					"expected error channel buffer size of %d, got %d",
+					tc.bufferSize,
+					cap(react.Errors()),
+				)
+			}
+		})
+	}
+}
+
+func TestNewReactor_WithInvalidErrorBufferSize(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		bufferSize  int
+		expectedErr error
+	}{
+		{"BufferSize0", 0, reactor.ErrMinErrorBufferSize},
+		{"BufferSizeNegative", -1, reactor.ErrMinErrorBufferSize},
+		{"BufferSizeTooLarge", 10001, reactor.ErrMaxErrorBufferSize},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := reactor.New(reactor.WithErrorBufferSize(tc.bufferSize))
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+
+			if !errors.Is(err, tc.expectedErr) {
+				t.Fatalf("expected error %v, got %v", tc.expectedErr, err)
+			}
+		})
+	}
+}
+
+func TestNewReactor_WithNilOption(t *testing.T) {
 	t.Parallel()
 
 	_, err := reactor.New(nil)
-	if !errors.Is(err, reactor.ErrWorkerIsNil) {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+
+	if !errors.Is(err, reactor.ErrNilOption) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrNilOption, err)
 	}
 }
 
-// TestReactor_StartOnce verifies that Start() can only be called once.
-// The second call should be a no-op and no errors should be sent.
-func TestReactor_StartOnce(t *testing.T) {
+func TestNewReactor_WithOptionError(t *testing.T) {
 	t.Parallel()
 
-	expectErr := errors.New("reactor already started")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
+	expectedErr := errors.New("option error")
+	opt := func(*reactor.Reactor) error {
+		return expectedErr
+	}
 
-	work := new(mockWorker)
+	_, err := reactor.New(opt)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
 
-	work.errCh = make(chan error, 1)
-	work.errCh <- expectErr
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
+	}
+}
 
-	rc, err := reactor.New(work)
+func TestNewReactor_WithLogger(t *testing.T) {
+	t.Parallel()
+
+	mockLogger := new(mockLogger)
+	ctx := context.Background()
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger))
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
 	}
 
-	rc.Start(ctx)
-
-	err, ok := <-rc.Errors()
-	if !errors.Is(err, expectErr) {
-		t.Fatalf("unexpected error: %v", err)
+	if err = react.Add(new(mockWorker)); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
 	}
 
-	if !ok {
-		t.Fatal("error channel closed unexpectedly")
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
 	}
 
-	rc.Start(ctx)
-
-	err, ok = <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error on second start: %v", err)
+	if len(mockLogger.debugLog) != 2 {
+		t.Fatalf("expected exactly two debug log entries, got %d", len(mockLogger.debugLog))
 	}
 
-	if ok {
-		t.Fatal("expected error channel to be closed on second start, but it was open")
-	}
-
-	if work.countStartCalls.Load() != 1 {
+	if !strings.Contains(mockLogger.debugLog[1].msg, "reactor: all workers completed") {
 		t.Fatalf(
-			"expected Start to be called once, but it was called %d times",
-			work.countStartCalls.Load(),
+			"expected debug log message to contain 'reactor: all workers completed', got '%s'",
+			mockLogger.debugLog[1].msg,
 		)
 	}
 
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
+	if mockLogger.debugLog[1].ctx != ctx {
+		t.Fatal("expected debug log context to match the context passed to Start")
+	}
+
+	if len(mockLogger.errorLog) != 0 {
+		t.Fatalf("expected no error log entries, got %d", len(mockLogger.errorLog))
 	}
 }
 
-// TestReactor_StartIsStarted verifies that calling Start() while the first Start() is running
-// is a no-op and does not launch the worker again.
-func TestReactor_StartIsStarted(t *testing.T) {
+func TestNewReactor_WithNilLogger(t *testing.T) {
 	t.Parallel()
 
-	expectErr := errors.New("reactor already started")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
+	_, err := reactor.New(reactor.WithLogger(nil))
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
 
-	work := new(mockWorker)
-	work.timeLifeStarted = 300 * time.Millisecond
+	if !errors.Is(err, reactor.ErrNilLogger) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrNilLogger, err)
+	}
+}
 
-	work.errCh = make(chan error, 1)
-	work.errCh <- expectErr
+func TestReactor_Add_NilWorker(t *testing.T) {
+	t.Parallel()
 
-	rc, err := reactor.New(work)
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
 	}
 
-	go rc.Start(ctx)
+	err = react.Add(nil)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+
+	if !errors.Is(err, reactor.ErrNilWorker) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrNilWorker, err)
+	}
+}
+
+func TestReactor_Add_IsStarted(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
+	}
+
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		mockWorker := new(mockWorker)
+		mockWorker.timeLifeStarted = 200 * time.Millisecond
+
+		if err = react.Add(mockWorker); err != nil {
+			t.Fatal("expected an error when adding worker to started reactor, got nil")
+		}
+
+		err = react.Start(context.Background())
+		if err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
 
 	time.Sleep(100 * time.Millisecond)
 
-	rc.Start(ctx)
-
-	time.Sleep(300 * time.Millisecond)
-
-	err, ok := <-rc.Errors()
-	if !errors.Is(err, expectErr) {
-		t.Fatalf("unexpected error: %v", err)
+	err = react.Add(new(mockWorker))
+	if err == nil {
+		t.Fatal("expected an error when adding worker to started reactor, got nil")
 	}
 
-	if !ok {
-		t.Fatal("error channel closed unexpectedly")
+	if !errors.Is(err, reactor.ErrIsStarted) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrIsStarted, err)
 	}
 
-	if work.countStartCalls.Load() != 1 {
+	wg.Wait()
+}
+
+func TestReactor_Add_IsStopped(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
+	}
+
+	if err = react.Add(new(mockWorker)); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	if err = react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	err = react.Add(new(mockWorker))
+	if err == nil {
+		t.Fatal("expected an error when adding worker to stopped reactor, got nil")
+	}
+
+	if !errors.Is(err, reactor.ErrIsStopped) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrIsStopped, err)
+	}
+}
+
+func TestReactor_Add_Concurrent(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	wg := &sync.WaitGroup{}
+	workers := make([]*mockWorker, 1000)
+
+	for idx := range workers {
+		wg.Go(func() {
+			workers[idx] = new(mockWorker)
+
+			if err := react.Add(workers[idx]); err != nil {
+				t.Fatalf("expected no error when adding worker, got %v", err)
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if err := react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	for idx := range workers {
+		if workers[idx].countStartCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d to have Start called once, got %d",
+				idx,
+				workers[idx].countStartCalls.Load(),
+			)
+		}
+	}
+}
+
+func TestReactor_Start_Restart(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
+	}
+
+	if err = react.Add(new(mockWorker)); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	if err = react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	err = react.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when starting an already started reactor, got nil")
+	}
+
+	if !errors.Is(err, reactor.ErrNotRestart) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrNotRestart, err)
+	}
+}
+
+func TestReactor_Start_SingleWorkerNilErrors(t *testing.T) {
+	t.Parallel()
+
+	mockWorker := new(mockWorker)
+	ctx := context.Background()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	errCh := react.Errors()
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if mockWorker.startCtx.Load() != ctx {
+		t.Fatal("expected worker Start context to match the context passed to Start")
+	}
+
+	if mockWorker.countStartCalls.Load() != 1 {
 		t.Fatalf(
-			"expected Start to be called once, but it was called %d times",
-			work.countStartCalls.Load(),
+			"expected worker Start to be called once, got %d",
+			mockWorker.countStartCalls.Load(),
 		)
 	}
 
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
 	}
 }
 
-// TestReactor_StartWithoutWorkers verifies that Start() works correctly
-// with no workers and properly closes the error channel.
-func TestReactor_StartWithoutWorkers(t *testing.T) {
+func TestReactor_Start_SingleWorkerReturnError(t *testing.T) {
 	t.Parallel()
 
-	rc, err := reactor.New()
+	expectedErr := errors.New("worker error")
+	mockWorker := new(mockWorker)
+	mockWorker.startErr = expectedErr
+	ctx := context.Background()
+
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 0 {
-		t.Fatalf("expected error channel capacity to be 0, got %d", cap(rc.Errors()))
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
 	}
 
-	rc.Start(context.Background())
+	errCh := react.Errors()
 
-	err, ok := <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
 	}
 
-	if ok {
-		t.Fatal("expected error channel to be closed, but it was open")
-	}
-}
-
-// TestReactor_StartSingleShortWorker verifies launching a single fast worker
-// and proper error channel closure.
-func TestReactor_StartSingleShortWorker(t *testing.T) {
-	t.Parallel()
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+	if mockWorker.startCtx.Load() != ctx {
+		t.Fatal("expected worker Start context to match the context passed to Start")
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	if mockWorker.countStartCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Start to be called once, got %d",
+			mockWorker.countStartCalls.Load(),
+		)
 	}
 
-	rc.Start(ctx)
-
-	err, ok := <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if len(errCh) != 1 {
+		t.Fatalf("expected error channel to have exactly one entry, got %d", len(errCh))
 	}
-
-	if ok {
-		t.Fatal("expected error channel to be closed, but it was open")
-	}
-
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
-	}
-}
-
-// TestReactor_StartSingleShortWorkerWithError verifies that worker errors
-// are properly forwarded to the reactor's error channel.
-func TestReactor_StartSingleShortWorkerWithError(t *testing.T) {
-	t.Parallel()
-
-	countErr := 0
-	expectedErr := errors.New("test error")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work := new(mockWorker)
-
-	work.errCh = make(chan error, 1)
-	work.errCh <- expectedErr
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
-	}
-
-	rc.Start(ctx)
-
-	for err := range rc.Errors() {
-		if !errors.Is(err, expectedErr) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countErr++
-	}
-
-	if countErr != 1 {
-		t.Fatalf("expected 1 error, got %d", countErr)
-	}
-
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
-	}
-}
-
-// TestReactor_StartSingleShortWorkerWithManyErrors verifies that multiple errors
-// from a single worker are collected correctly based on buffer size.
-func TestReactor_StartSingleShortWorkerWithManyErrors(t *testing.T) {
-	t.Parallel()
-
-	countErr := 0
-	expectedErr := errors.New("test error")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 50)
-
-	for range 50 {
-		work.errCh <- expectedErr
-	}
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 50 {
-		t.Fatalf("expected error channel capacity to be 50, got %d", cap(rc.Errors()))
-	}
-
-	rc.Start(ctx)
-
-	for err := range rc.Errors() {
-		if !errors.Is(err, expectedErr) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countErr++
-	}
-
-	if countErr != 50 {
-		t.Fatalf("expected 50 errors, got %d", countErr)
-	}
-
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
-	}
-}
-
-// TestReactor_StartMultipleShortWorkers verifies concurrent launching of multiple
-// fast workers and proper error channel closure.
-func TestReactor_StartMultipleShortWorkers(t *testing.T) {
-	t.Parallel()
-
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 1)
-
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 1)
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	rc, err := reactor.New(work1, work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rc.Errors()))
-	}
-
-	rc.Start(ctx)
-
-	err, ok := <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if ok {
-		t.Fatal("expected error channel to be closed, but it was open")
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-
-	if work2.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 2")
-	}
-}
-
-// TestReactor_StartMultipleShortWorkersWithErrors verifies that errors from multiple
-// workers are properly aggregated into a single error channel.
-func TestReactor_StartMultipleShortWorkersWithErrors(t *testing.T) {
-	t.Parallel()
-
-	countErr := 0
-	expectedErr1 := errors.New("test error 1")
-	expectedErr2 := errors.New("test error 2")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work1 := new(mockWorker)
-
-	work1.errCh = make(chan error, 1)
-	work1.errCh <- expectedErr1
-
-	work2 := new(mockWorker)
-
-	work2.errCh = make(chan error, 1)
-	work2.errCh <- expectedErr2
-
-	rc, err := reactor.New(work1, work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rc.Errors()))
-	}
-
-	rc.Start(ctx)
-
-	for err := range rc.Errors() {
-		if !errors.Is(err, expectedErr1) && !errors.Is(err, expectedErr2) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countErr++
-	}
-
-	if countErr != 2 {
-		t.Fatalf("expected 2 errors, got %d", countErr)
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-
-	if work2.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 2")
-	}
-}
-
-// TestReactor_StartMultipleShortWorkersWithManyErrors verifies that multiple errors
-// from several workers are properly collected and forwarded through the error channel.
-func TestReactor_StartMultipleShortWorkersWithManyErrors(t *testing.T) {
-	t.Parallel()
-
-	countErr := 0
-	expectedErr1 := errors.New("test error 1")
-	expectedErr2 := errors.New("test error 2")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 50)
-
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 50)
-
-	for range 50 {
-		work1.errCh <- expectedErr1
-
-		work2.errCh <- expectedErr2
-	}
-
-	rc, err := reactor.New(work1, work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 100 {
-		t.Fatalf("expected error channel capacity to be 100, got %d", cap(rc.Errors()))
-	}
-
-	rc.Start(ctx)
-
-	for err := range rc.Errors() {
-		if !errors.Is(err, expectedErr1) && !errors.Is(err, expectedErr2) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countErr++
-	}
-
-	if countErr != 100 {
-		t.Fatalf("expected 100 errors, got %d", countErr)
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-}
-
-// TestReactor_StartSingleLongWorker verifies launching a long-running worker
-// with proper handling and blocking of Start().
-func TestReactor_StartSingleLongWorker(t *testing.T) {
-	t.Parallel()
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	work.timeLifeStarted = 500 * time.Millisecond
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
-	}
-
-	go rc.Start(ctx)
 
 	select {
-	case err := <-rc.Errors():
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+	case err := <-errCh:
+		if !errors.Is(err, expectedErr) {
+			t.Fatalf("expected error %v, got %v", expectedErr, err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for worker to start")
-	}
-
-	err, ok := <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if ok {
-		t.Fatal("expected error channel to be closed, but it was open")
-	}
-
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
+	default:
+		t.Fatal("expected an error in the error channel, but it was empty")
 	}
 }
 
-// TestReactor_StartSingleLongWorkerWithError verifies that errors from a long-running worker
-// are properly forwarded to the error channel during execution.
-func TestReactor_StartSingleLongWorkerWithError(t *testing.T) {
+func TestReactor_Start_SingleWorkerRuntimeErrors(t *testing.T) {
 	t.Parallel()
 
-	expectedErr := errors.New("test error")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
+	expectedErr := errors.New("worker error")
+	mockWorker := new(mockWorker)
 
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
+	mockWorker.errCh = make(chan error, 1)
+	mockWorker.errCh <- expectedErr
 
-	work.timeLifeStarted = 500 * time.Millisecond
-	work.errCh <- expectedErr
+	ctx := context.Background()
 
-	rc, err := reactor.New(work)
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
 	}
 
-	go rc.Start(ctx)
+	errCh := react.Errors()
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if mockWorker.startCtx.Load() != ctx {
+		t.Fatal("expected worker Start context to match the context passed to Start")
+	}
+
+	if mockWorker.countStartCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Start to be called once, got %d",
+			mockWorker.countStartCalls.Load(),
+		)
+	}
+
+	if len(errCh) != 1 {
+		t.Fatalf("expected error channel to have exactly one entry, got %d", len(errCh))
+	}
 
 	select {
-	case err := <-rc.Errors():
+	case err := <-errCh:
 		if !errors.Is(err, expectedErr) {
-			t.Fatalf("unexpected error: %v", err)
+			t.Fatalf("expected error %v, got %v", expectedErr, err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for worker to start")
-	}
-
-	err, ok := <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if ok {
-		t.Fatal("expected error channel to be closed, but it was open")
-	}
-
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
+	default:
+		t.Fatal("expected an error in the error channel, but it was empty")
 	}
 }
 
-// TestReactor_StartSingleLongWorkerWithManyErrors verifies that multiple errors
-// from a long-running worker are properly forwarded and all errors reach the reader.
-func TestReactor_StartSingleLongWorkerWithManyErrors(t *testing.T) {
+func TestReactor_Start_SingleWorkerMixedErrors(t *testing.T) {
 	t.Parallel()
 
-	expectedErr := errors.New("test error")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
+	expectedErr := errors.New("worker error")
+	mockWorker := new(mockWorker)
+	mockWorker.startErr = expectedErr
 
-	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	defer cancel()
+	mockWorker.errCh = make(chan error, 1)
+	mockWorker.errCh <- expectedErr
 
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	work.timeLifeStarted = 500 * time.Millisecond
+	ctx := context.Background()
 
-	rc, err := reactor.New(work)
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
 	}
 
-	var (
-		countWriteErr atomic.Int32
-		countReadErr  atomic.Int32
-	)
+	errCh := react.Errors()
 
-	go rc.Start(ctx)
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
 
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
+	if mockWorker.startCtx.Load() != ctx {
+		t.Fatal("expected worker Start context to match the context passed to Start")
+	}
 
-		for range ticker.C {
+	if mockWorker.countStartCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Start to be called once, got %d",
+			mockWorker.countStartCalls.Load(),
+		)
+	}
+
+	if len(errCh) != 2 {
+		t.Fatalf("expected error channel to have exactly two entries, got %d", len(errCh))
+	}
+
+	for range 2 {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error %v, got %v", expectedErr, err)
+			}
+		default:
+			t.Fatal("expected an error in the error channel, but it was empty")
+		}
+	}
+}
+
+func TestReactor_Start_MultipleWorkersNilErrors(t *testing.T) {
+	t.Parallel()
+
+	workers := make([]*mockWorker, 1000)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	errCh := react.Errors()
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	for idx := range workers {
+		if workers[idx].startCtx.Load() != ctx {
+			t.Fatalf("expected worker %d Start context to match the context passed to Start", idx)
+		}
+
+		if workers[idx].countStartCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Start to be called once, got %d",
+				idx,
+				workers[idx].countStartCalls.Load(),
+			)
+		}
+	}
+
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
+	}
+}
+
+func TestReactor_Start_MultipleWorkersReturnErrors(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	workers := make([]*mockWorker, 1000)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].startErr = expectedErr
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	errCh := react.Errors()
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	for idx := range workers {
+		if workers[idx].startCtx.Load() != ctx {
+			t.Fatalf("expected worker %d Start context to match the context passed to Start", idx)
+		}
+
+		if workers[idx].countStartCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Start to be called once, got %d",
+				idx,
+				workers[idx].countStartCalls.Load(),
+			)
+		}
+	}
+
+	if len(errCh) != len(workers) {
+		t.Fatalf("expected error channel to have %d entries, got %d", len(workers), len(errCh))
+	}
+
+	for idx := range workers {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error %v from worker %d, got %v", expectedErr, idx, err)
+			}
+		default:
+			t.Fatalf("expected an error from worker %d in the error channel, but it was empty", idx)
+		}
+	}
+}
+
+func TestReactor_Start_MultipleWorkersRuntimeErrors(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	workers := make([]*mockWorker, 1000)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+
+		workers[idx].errCh = make(chan error, 1)
+		workers[idx].errCh <- expectedErr
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	errCh := react.Errors()
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	for idx := range workers {
+		if workers[idx].startCtx.Load() != ctx {
+			t.Fatalf("expected worker %d Start context to match the context passed to Start", idx)
+		}
+
+		if workers[idx].countStartCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Start to be called once, got %d",
+				idx,
+				workers[idx].countStartCalls.Load(),
+			)
+		}
+	}
+
+	if len(errCh) != len(workers) {
+		t.Fatalf("expected error channel to have %d entries, got %d", len(workers), len(errCh))
+	}
+
+	for idx := range workers {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error %v from worker %d, got %v", expectedErr, idx, err)
+			}
+		default:
+			t.Fatalf("expected an error from worker %d in the error channel, but it was empty", idx)
+		}
+	}
+}
+
+func TestReactor_Start_MultipleWorkersMixedErrors(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	workers := make([]*mockWorker, 500)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].startErr = expectedErr
+
+		workers[idx].errCh = make(chan error, 1)
+		workers[idx].errCh <- expectedErr
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	errCh := react.Errors()
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	for idx := range workers {
+		if workers[idx].startCtx.Load() != ctx {
+			t.Fatalf("expected worker %d Start context to match the context passed to Start", idx)
+		}
+
+		if workers[idx].countStartCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Start to be called once, got %d",
+				idx,
+				workers[idx].countStartCalls.Load(),
+			)
+		}
+	}
+
+	if len(errCh) != len(workers)*2 {
+		t.Fatalf("expected error channel to have %d entries, got %d", len(workers)*2, len(errCh))
+	}
+
+	for idx := range workers {
+		for range 2 {
 			select {
-			case <-ctx.Done():
-				return
+			case err := <-errCh:
+				if !errors.Is(err, expectedErr) {
+					t.Fatalf("expected error %v from worker %d, got %v", expectedErr, idx, err)
+				}
 			default:
-				work.errCh <- expectedErr
-
-				countWriteErr.Add(1)
+				t.Fatalf(
+					"expected an error from worker %d in the error channel, but it was empty",
+					idx,
+				)
 			}
 		}
-	}()
-
-	for err := range rc.Errors() {
-		if !errors.Is(err, expectedErr) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countReadErr.Add(1)
-	}
-
-	if countWriteErr.Load() == 0 {
-		t.Fatal(
-			"expected at least one error to be written to the worker's error channel, but none were written",
-		)
-	}
-
-	if countWriteErr.Load() != countReadErr.Load() {
-		t.Fatalf(
-			"expected number of errors read from reactor to match number of errors written to worker, "+
-				"but got %d read and %d written",
-			countReadErr.Load(),
-			countWriteErr.Load(),
-		)
-	}
-
-	if work.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start")
 	}
 }
 
-// TestReactor_StartMultipleLongWorkers verifies concurrent launching of multiple
-// long-running workers with different execution durations.
-func TestReactor_StartMultipleLongWorkers(t *testing.T) {
+func TestReactor_Start_MultipleWorkersCancelContext(t *testing.T) {
 	t.Parallel()
 
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 1)
-	work1.timeLifeStarted = 300 * time.Millisecond
+	workers := make([]*mockWorker, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 1)
-	work2.timeLifeStarted = 500 * time.Millisecond
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].timeLifeStarted = 200 * time.Millisecond
+	}
 
-	rc, err := reactor.New(work1, work2)
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rc.Errors()))
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
 	}
 
-	go rc.Start(ctx)
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	wg.Wait()
+
+	for idx := range workers {
+		if workers[idx].startCtx.Load() != ctx {
+			t.Fatalf("expected worker %d Start context to match the context passed to Start", idx)
+		}
+
+		if workers[idx].countStartCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Start to be called once, got %d",
+				idx,
+				workers[idx].countStartCalls.Load(),
+			)
+		}
+	}
+
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
+	}
+}
+
+func TestReactor_Start_MultipleWorkersFullErrorsChannel(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	workers := make([]*mockWorker, 1000)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].startErr = expectedErr
+	}
+
+	react, err := reactor.New(reactor.WithErrorBufferSize(10))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	errCh := react.Errors()
+
+	err = react.Start(ctx)
+	if err == nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if !errors.Is(err, reactor.ErrChannelFull) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrChannelFull, err)
+	}
+
+	if len(errCh) != 10 {
+		t.Fatalf("expected error channel to have 10 entries (buffer size), got %d", len(errCh))
+	}
+
+	for idx := range errCh {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error %v from worker %d, got %v", expectedErr, idx, err)
+			}
+		default:
+			t.Fatalf("expected an error from worker %d in the error channel, but it was empty", idx)
+		}
+	}
+}
+
+func TestReactor_Start_NoWorkers(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	errCh := react.Errors()
+
+	err = react.Start(context.Background())
+	if err == nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if !errors.Is(err, reactor.ErrNoWorkers) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrNoWorkers, err)
+	}
+
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
+	}
+}
+
+func TestReactor_Start_WithLogger(t *testing.T) {
+	t.Parallel()
+
+	mockLogger := new(mockLogger)
+	mockWork := new(mockWorker)
+	ctx := context.Background()
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWork); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	if err := react.Start(ctx); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if len(mockLogger.debugLog) != 2 {
+		t.Fatalf("expected exactly two debug log entries, got %d", len(mockLogger.debugLog))
+	}
+
+	if !strings.Contains(mockLogger.debugLog[0].msg, "reactor: starting worker") {
+		t.Fatalf(
+			"expected first debug log message to contain 'reactor: starting worker', got '%s'",
+			mockLogger.debugLog[0].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[0].args) != 1 {
+		t.Fatalf(
+			"expected first debug log to have exactly one argument, got %d",
+			len(mockLogger.debugLog[0].args),
+		)
+	}
+
+	args, ok := mockLogger.debugLog[0].args[0].(reactor.LogArgs)
+	if !ok {
+		t.Fatal("expected first debug log argument to be of type reactor.LogArgs")
+	}
+
+	worker, ok := args["worker"]
+	if !ok {
+		t.Fatal("expected first debug log argument to have key 'worker'")
+	}
+
+	mWorker, ok := worker.(*mockWorker)
+	if !ok {
+		t.Fatal("expected 'worker' argument to be of type *mockWorker")
+	}
+
+	if mWorker != mockWork {
+		t.Fatal(
+			"expected 'worker' argument to be the mockWorker instance added to the reactor",
+		)
+	}
+
+	if mockLogger.debugLog[0].ctx != ctx {
+		t.Fatal("expected first debug log context to match the context passed to Start")
+	}
+
+	if !strings.Contains(mockLogger.debugLog[1].msg, "reactor: all workers completed") {
+		t.Fatalf(
+			"expected second debug log message to contain 'reactor: all workers completed', got '%s'",
+			mockLogger.debugLog[1].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[1].args) != 0 {
+		t.Fatalf(
+			"expected second debug log to have no arguments, got %d",
+			len(mockLogger.debugLog[1].args),
+		)
+	}
+
+	if mockLogger.debugLog[1].ctx != ctx {
+		t.Fatal("expected second debug log context to match the context passed to Start")
+	}
+
+	if len(mockLogger.errorLog) != 0 {
+		t.Fatalf("expected no error log entries, got %d", len(mockLogger.errorLog))
+	}
+}
+
+func TestReactor_Start_WithLoggerCancelContext(t *testing.T) {
+	t.Parallel()
+
+	mockLogger := new(mockLogger)
+	mockWork := new(mockWorker)
+	mockWork.timeLifeStarted = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWork); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	wg.Wait()
+
+	if len(mockLogger.debugLog) != 2 {
+		t.Fatalf("expected exactly two debug log entries, got %d", len(mockLogger.debugLog))
+	}
+
+	if !strings.Contains(mockLogger.debugLog[0].msg, "reactor: starting worker") {
+		t.Fatalf(
+			"expected first debug log message to contain 'reactor: starting worker', got '%s'",
+			mockLogger.debugLog[0].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[0].args) != 1 {
+		t.Fatalf(
+			"expected first debug log to have exactly one argument, got %d",
+			len(mockLogger.debugLog[0].args),
+		)
+	}
+
+	args, ok := mockLogger.debugLog[0].args[0].(reactor.LogArgs)
+	if !ok {
+		t.Fatal("expected first debug log argument to be of type reactor.LogArgs")
+	}
+
+	worker, ok := args["worker"]
+	if !ok {
+		t.Fatal("expected first debug log argument to have key 'worker'")
+	}
+
+	mWorker, ok := worker.(*mockWorker)
+	if !ok {
+		t.Fatal("expected 'worker' argument to be of type *mockWorker")
+	}
+
+	if mWorker != mockWork {
+		t.Fatal(
+			"expected 'worker' argument to be the mockWorker instance added to the reactor",
+		)
+	}
+
+	if mockLogger.debugLog[0].ctx != ctx {
+		t.Fatal("expected first debug log context to match the context passed to Start")
+	}
+
+	if !strings.Contains(
+		mockLogger.debugLog[1].msg,
+		"reactor: workers startup cancelled by context",
+	) {
+		t.Fatalf(
+			"expected second debug log message to contain 'reactor: workers startup cancelled by context', got '%s'",
+			mockLogger.debugLog[1].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[1].args) != 0 {
+		t.Fatalf(
+			"expected second debug log to have no arguments, got %d",
+			len(mockLogger.debugLog[1].args),
+		)
+	}
+
+	if mockLogger.debugLog[1].ctx != ctx {
+		t.Fatal("expected second debug log context to match the context passed to Start")
+	}
+
+	if len(mockLogger.errorLog) != 0 {
+		t.Fatalf("expected no error log entries, got %d", len(mockLogger.errorLog))
+	}
+}
+
+func TestReactor_Start_WithLoggerFullErrorsChannel(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	mockLogger := new(mockLogger)
+	workers := make([]*mockWorker, 2)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].startErr = expectedErr
+		workers[idx].timeLifeStarted = 100 * time.Millisecond
+	}
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger), reactor.WithErrorBufferSize(1))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	err = react.Start(ctx)
+	if err == nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if !errors.Is(err, reactor.ErrChannelFull) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrChannelFull, err)
+	}
+
+	if len(mockLogger.debugLog) != 2 {
+		t.Fatalf("expected exactly two debug log entries, got %d", len(mockLogger.debugLog))
+	}
+
+	for idx := range mockLogger.debugLog {
+		if !strings.Contains(mockLogger.debugLog[idx].msg, "reactor: starting worker") {
+			t.Fatalf(
+				"expected debug log message to contain 'reactor: starting worker', got '%s'",
+				mockLogger.debugLog[idx].msg,
+			)
+		}
+
+		if len(mockLogger.debugLog[idx].args) != 1 {
+			t.Fatalf(
+				"expected debug log to have exactly one argument, got %d",
+				len(mockLogger.debugLog[idx].args),
+			)
+		}
+
+		args, ok := mockLogger.debugLog[idx].args[0].(reactor.LogArgs)
+		if !ok {
+			t.Fatal("expected debug log argument to be of type reactor.LogArgs")
+		}
+
+		worker, ok := args["worker"]
+		if !ok {
+			t.Fatal("expected debug log argument to have key 'worker'")
+		}
+
+		if _, ok := worker.(*mockWorker); !ok {
+			t.Fatal("expected 'worker' argument to be of type *mockWorker")
+		}
+
+		if mockLogger.debugLog[idx].ctx != ctx {
+			t.Fatal("expected debug log context to match the context passed to Start")
+		}
+	}
+
+	if len(mockLogger.errorLog) != 1 {
+		t.Fatalf("expected exactly one error log entry, got %d", len(mockLogger.errorLog))
+	}
+
+	if !errors.Is(mockLogger.errorLog[0].err, reactor.ErrFailedToSend) {
+		t.Fatalf(
+			"expected error log to contain error %v, got %v",
+			reactor.ErrFailedToSend,
+			mockLogger.errorLog[0].err,
+		)
+	}
+
+	if !errors.Is(mockLogger.errorLog[0].err, expectedErr) {
+		t.Fatalf(
+			"expected error log to contain error %v, got %v",
+			expectedErr,
+			mockLogger.errorLog[0].err,
+		)
+	}
+
+	if mockLogger.errorLog[0].ctx != ctx {
+		t.Fatal("expected error log context to match the context passed to Start")
+	}
+
+	if len(mockLogger.errorLog[0].args) != 0 {
+		t.Fatalf(
+			"expected error log to have no arguments, got %d",
+			len(mockLogger.errorLog[0].args),
+		)
+	}
+}
+
+func TestReactor_Shutdown_NotStarted(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
+	}
+
+	err = react.Shutdown(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when shutting down a not started reactor, got nil")
+	}
+
+	if !errors.Is(err, reactor.ErrNotStarted) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrNotStarted, err)
+	}
+}
+
+func TestReactor_Shutdown_IsStopped(t *testing.T) {
+	t.Parallel()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil reactor, got nil")
+	}
+
+	if err := react.Add(new(mockWorker)); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	err = react.Start(context.Background())
+	if err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	err = react.Shutdown(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when shutting down an already stopped reactor, got nil")
+	}
+
+	if !errors.Is(err, reactor.ErrIsStopped) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrIsStopped, err)
+	}
+}
+
+func TestReactor_Shutdown_SingleWorkerNilErrors(t *testing.T) {
+	t.Parallel()
+
+	mockWorker := new(mockWorker)
+	mockWorker.timeLifeStarted = 200 * time.Millisecond
+	ctx := context.Background()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := react.Shutdown(ctx); err != nil {
+		t.Fatalf("expected no error from Shutdown, got %v", err)
+	}
+
+	if mockWorker.shutdownCtx.Load() != ctx {
+		t.Fatal("expected worker Shutdown context to match the context passed to Shutdown")
+	}
+
+	if mockWorker.countShutdownCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Shutdown to be called once, got %d",
+			mockWorker.countShutdownCalls.Load(),
+		)
+	}
+
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
+	}
+
+	wg.Wait()
+}
+
+func TestReactor_Shutdown_SingleWorkerReturnError(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	mockWorker := new(mockWorker)
+	mockWorker.shutdownErr = expectedErr
+	mockWorker.timeLifeStarted = 200 * time.Millisecond
+	ctx := context.Background()
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := react.Shutdown(ctx); err != nil {
+		t.Fatalf("expected no error from Shutdown, got %v", err)
+	}
+
+	if mockWorker.shutdownCtx.Load() != ctx {
+		t.Fatal("expected worker Shutdown context to match the context passed to Shutdown")
+	}
+
+	if mockWorker.countShutdownCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Shutdown to be called once, got %d",
+			mockWorker.countShutdownCalls.Load(),
+		)
+	}
+
+	if len(errCh) != 1 {
+		t.Fatalf("expected error channel to have exactly one entry, got %d", len(errCh))
+	}
 
 	select {
-	case err := <-rc.Errors():
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+	case err := <-errCh:
+		if !errors.Is(err, expectedErr) {
+			t.Fatalf("expected error %v, got %v", expectedErr, err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for workers to start")
+	default:
+		t.Fatal("expected an error in the error channel, but it was empty")
 	}
 
-	err, ok := <-rc.Errors()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if ok {
-		t.Fatal("expected error channel to be closed, but it was open")
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-
-	if work2.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 2")
-	}
+	wg.Wait()
 }
 
-// TestReactor_StartMultipleLongWorkersWithErrors verifies that errors from multiple
-// long-running workers are properly aggregated into a single error channel.
-func TestReactor_StartMultipleLongWorkersWithErrors(t *testing.T) {
+func TestReactor_Shutdown_MultipleWorkersNilErrors(t *testing.T) {
 	t.Parallel()
 
-	expectedErr1 := errors.New("test error 1")
-	expectedErr2 := errors.New("test error 2")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 1)
-
-	work1.timeLifeStarted = 300 * time.Millisecond
-	work1.errCh <- expectedErr1
-
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 1)
-
-	work2.timeLifeStarted = 500 * time.Millisecond
-	work2.errCh <- expectedErr2
-
-	rc, err := reactor.New(work1, work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rc.Errors()))
-	}
-
-	go rc.Start(ctx)
-
-	isExpectedErr1Received := false
-	isExpectedErr2Received := false
-	countErr := 0
-	finishTime := time.Now().Add(time.Second)
-
-	for err := range rc.Errors() {
-		if time.Now().After(finishTime) {
-			t.Fatal("timeout waiting for errors from workers")
-		}
-
-		if !errors.Is(err, expectedErr1) && !errors.Is(err, expectedErr2) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		if errors.Is(err, expectedErr1) {
-			isExpectedErr1Received = true
-		}
-
-		if errors.Is(err, expectedErr2) {
-			isExpectedErr2Received = true
-		}
-
-		countErr++
-	}
-
-	if !isExpectedErr1Received {
-		t.Fatal("expected error 1 not received")
-	}
-
-	if !isExpectedErr2Received {
-		t.Fatal("expected error 2 not received")
-	}
-
-	if countErr != 2 {
-		t.Fatalf("expected 2 errors, got %d", countErr)
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-
-	if work2.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 2")
-	}
-}
-
-// TestReactor_StartMultipleLongWorkersWithManyErrors verifies that multiple errors
-// from several long-running workers are properly collected in parallel.
-func TestReactor_StartMultipleLongWorkersWithManyErrors(t *testing.T) {
-	t.Parallel()
-
-	expectedErr1 := errors.New("test error 1")
-	expectedErr2 := errors.New("test error 2")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	defer cancel()
-
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 1)
-	work1.timeLifeStarted = 500 * time.Millisecond
-
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 1)
-	work2.timeLifeStarted = 500 * time.Millisecond
-
-	rc, err := reactor.New(work1, work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rc.Errors()))
-	}
-
-	var (
-		countWriteErr atomic.Int32
-		countReadErr  atomic.Int32
-	)
-
-	go rc.Start(ctx)
-
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			select {
-			case <-ctx.Done():
-				return
-			case work1.errCh <- expectedErr1:
-				countWriteErr.Add(1)
-			}
-		}
-	}()
-
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			select {
-			case <-ctx.Done():
-				return
-			case work2.errCh <- expectedErr2:
-				countWriteErr.Add(1)
-			}
-		}
-	}()
-
-	finishTime := time.Now().Add(time.Second)
-
-	for err := range rc.Errors() {
-		if time.Now().After(finishTime) {
-			t.Fatal("timeout waiting for errors from workers")
-		}
-
-		if !errors.Is(err, expectedErr1) && !errors.Is(err, expectedErr2) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countReadErr.Add(1)
-	}
-
-	if countWriteErr.Load() == 0 {
-		t.Fatal(
-			"expected at least one error to be written to the workers' error channels, but none were written",
-		)
-	}
-
-	if countWriteErr.Load() != countReadErr.Load() {
-		t.Fatalf(
-			"expected number of errors read from reactor to match number of errors written to workers, "+
-				"but got %d read and %d written",
-			countReadErr.Load(),
-			countWriteErr.Load(),
-		)
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-}
-
-// TestReactor_ShutdownWithoutStart verifies that calling Shutdown() without Start()
-// is a safe no-op and does not invoke Shutdown on workers.
-func TestReactor_ShutdownWithoutStart(t *testing.T) {
-	t.Parallel()
-
+	workers := make([]*mockWorker, 1000)
 	ctx := context.Background()
 
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].timeLifeStarted = 200 * time.Millisecond
+	}
 
-	rc, err := reactor.New(work)
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
 	}
 
-	rc.Shutdown(ctx)
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
 
-	if work.countShutdownCalls.Load() != 0 {
-		t.Fatalf(
-			"expected Shutdown to not be called, but it was called %d times",
-			work.countShutdownCalls.Load(),
-		)
-	}
-}
-
-// TestReactor_ShutdownAfterStart verifies that Shutdown() after Start() completes
-// does not invoke Shutdown on workers since they are already stopped.
-func TestReactor_ShutdownAfterStart(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
-	}
-
-	rc.Start(ctx)
-	rc.Shutdown(ctx)
-
-	if work.countStartCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Start to be called once, but it was called %d times",
-			work.countStartCalls.Load(),
-		)
-	}
-
-	if work.countShutdownCalls.Load() != 0 {
-		t.Fatalf(
-			"expected Shutdown to not be called, but it was called %d times",
-			work.countShutdownCalls.Load(),
-		)
-	}
-}
-
-// TestReactor_ShutdownOnce verifies that Shutdown() can only be called once
-// and subsequent calls are no-ops thanks to sync.Once.
-func TestReactor_ShutdownOnce(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	work.timeLifeStarted = 500 * time.Millisecond
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
-	}
-
-	go rc.Start(ctx)
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
 
 	time.Sleep(100 * time.Millisecond)
 
-	rc.Shutdown(ctx)
-	rc.Shutdown(ctx)
-
-	if work.countShutdownCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Shutdown to be called once, but it was called %d times",
-			work.countShutdownCalls.Load(),
-		)
+	if err := react.Shutdown(ctx); err != nil {
+		t.Fatalf("expected no error from Shutdown, got %v", err)
 	}
 
-	if work.shutdownCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Shutdown")
+	for idx := range workers {
+		if workers[idx].shutdownCtx.Load() != ctx {
+			t.Fatalf(
+				"expected worker %d Shutdown context to match the context passed to Shutdown",
+				idx,
+			)
+		}
+
+		if workers[idx].countShutdownCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Shutdown to be called once, got %d",
+				idx,
+				workers[idx].countShutdownCalls.Load(),
+			)
+		}
 	}
+
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
+	}
+
+	wg.Wait()
 }
 
-// TestReactor_ShutdownOnceConcurrent verifies that concurrent Shutdown() calls
-// are properly handled with only the first call executing worker shutdown.
-func TestReactor_ShutdownOnceConcurrent(t *testing.T) {
+func TestReactor_Shutdown_MultipleWorkersReturnErrors(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
+	expectedErr := errors.New("worker error")
+	workers := make([]*mockWorker, 1000)
+	ctx := context.Background()
 
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	work.timeLifeStarted = 500 * time.Millisecond
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].shutdownErr = expectedErr
+		workers[idx].timeLifeStarted = 200 * time.Millisecond
+	}
 
-	rc, err := reactor.New(work)
+	react, err := reactor.New()
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
 	}
 
-	go rc.Start(ctx)
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
 
 	time.Sleep(100 * time.Millisecond)
 
-	wg := sync.WaitGroup{}
+	if err := react.Shutdown(ctx); err != nil {
+		t.Fatalf("expected no error from Shutdown, got %v", err)
+	}
+
+	for idx := range workers {
+		if workers[idx].shutdownCtx.Load() != ctx {
+			t.Fatalf(
+				"expected worker %d Shutdown context to match the context passed to Shutdown",
+				idx,
+			)
+		}
+
+		if workers[idx].countShutdownCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Shutdown to be called once, got %d",
+				idx,
+				workers[idx].countShutdownCalls.Load(),
+			)
+		}
+	}
+
+	if len(errCh) != len(workers) {
+		t.Fatalf("expected error channel to have %d entries, got %d", len(workers), len(errCh))
+	}
+
+	for idx := range workers {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error %v from worker %d, got %v", expectedErr, idx, err)
+			}
+		default:
+			t.Fatalf("expected an error from worker %d in the error channel, but it was empty", idx)
+		}
+	}
+
+	wg.Wait()
+}
+
+func TestReactor_Shutdown_MultipleWorkersCancelContext(t *testing.T) {
+	t.Parallel()
+
+	workers := make([]*mockWorker, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].timeLifeStarted = 200 * time.Millisecond
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
 
 	wg.Go(func() {
-		rc.Shutdown(ctx)
+		if err := react.Start(context.Background()); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
 	})
 
-	wg.Go(func() {
-		rc.Shutdown(ctx)
-	})
+	time.Sleep(100 * time.Millisecond)
+	cancel()
 
 	wg.Go(func() {
-		rc.Shutdown(ctx)
+		if err := react.Shutdown(ctx); err != nil {
+			t.Fatalf("expected no error from Shutdown, got %v", err)
+		}
 	})
 
 	wg.Wait()
 
-	if work.countShutdownCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Shutdown to be called once, but it was called %d times",
-			work.countShutdownCalls.Load(),
-		)
-	}
-
-	if work.shutdownCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Shutdown")
-	}
-}
-
-// TestReactor_ShutdownSingleLongWorker verifies graceful shutdown of a long-running worker
-// and that Shutdown() properly waits for worker.Shutdown() completion.
-func TestReactor_ShutdownSingleLongWorker(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	work.timeLifeStarted = 500 * time.Millisecond
-	work.timeLifeShutdown = 100 * time.Millisecond
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
-	}
-
-	go rc.Start(ctx)
-
-	time.Sleep(100 * time.Millisecond)
-
-	start := time.Now()
-
-	rc.Shutdown(ctx)
-
-	end := time.Since(start)
-
-	if end > 300*time.Millisecond {
-		t.Fatalf("shutdown took too long: %v", end)
-	}
-
-	if work.countShutdownCalls.Load() != 1 {
-		t.Fatal("expected Shutdown to be called once, but it was called multiple times")
-	}
-
-	if work.shutdownCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Shutdown")
-	}
-}
-
-// TestReactor_ShutdownMultipleLongWorkers verifies concurrent shutdown of multiple
-// long-running workers and that Shutdown() waits for the slowest one.
-func TestReactor_ShutdownMultipleLongWorkers(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 1)
-	work1.timeLifeStarted = 300 * time.Millisecond
-	work1.timeLifeShutdown = 100 * time.Millisecond
-
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 1)
-	work2.timeLifeStarted = 500 * time.Millisecond
-	work2.timeLifeShutdown = 200 * time.Millisecond
-
-	rc, err := reactor.New(work1, work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rc.Errors()))
-	}
-
-	go rc.Start(ctx)
-
-	time.Sleep(100 * time.Millisecond)
-
-	start := time.Now()
-
-	rc.Shutdown(ctx)
-
-	end := time.Since(start)
-
-	if end > 500*time.Millisecond {
-		t.Fatalf("shutdown took too long: %v", end)
-	}
-
-	if work1.countShutdownCalls.Load() != 1 {
-		t.Fatal("expected Shutdown to be called once for worker 1, but it was not called")
-	}
-
-	if work2.countShutdownCalls.Load() != 1 {
-		t.Fatal("expected Shutdown to be called once for worker 2, but it was not called")
-	}
-
-	if work1.shutdownCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Shutdown for worker 1")
-	}
-
-	if work2.shutdownCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Shutdown for worker 2")
-	}
-}
-
-// TestReactor_ShutdownWithCancelledContext verifies that Shutdown() properly handles
-// the case when the context is cancelled before workers complete shutdown.
-func TestReactor_ShutdownWithCancelledContext(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	work := new(mockWorker)
-	work.errCh = make(chan error, 1)
-	work.timeLifeStarted = 500 * time.Millisecond
-	work.timeLifeShutdown = 500 * time.Millisecond
-
-	rc, err := reactor.New(work)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
-	}
-
-	if cap(rc.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1, got %d", cap(rc.Errors()))
-	}
-
-	go rc.Start(ctx)
-
-	time.Sleep(100 * time.Millisecond)
-
-	go rc.Shutdown(ctx)
-
-	select {
-	case <-ctx.Done():
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("timeout waiting for context to be cancelled")
-	}
-}
-
-// TestReactor_NestedReactors verifies that Reactor can be used as a Worker
-// and allows creating hierarchical reactor structures.
-func TestReactor_NestedReactors(t *testing.T) {
-	t.Parallel()
-
-	expectErr1 := errors.New("test error1")
-	expectErr2 := errors.New("test error2")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	work1 := new(mockWorker)
-	work1.errCh = make(chan error, 1)
-	work1.timeLifeStarted = 300 * time.Millisecond
-
-	work1.timeLifeShutdown = 100 * time.Millisecond
-	work1.errCh <- expectErr1
-
-	work2 := new(mockWorker)
-	work2.errCh = make(chan error, 1)
-	work2.timeLifeStarted = 500 * time.Millisecond
-
-	work2.timeLifeShutdown = 200 * time.Millisecond
-	work2.errCh <- expectErr2
-
-	rc1, err := reactor.New(work1)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor 1: %v", err)
-	}
-
-	if cap(rc1.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1 for reactor 1, got %d", cap(rc1.Errors()))
-	}
-
-	rc2, err := reactor.New(work2)
-	if err != nil {
-		t.Fatalf("unexpected error creating reactor 2: %v", err)
-	}
-
-	if cap(rc2.Errors()) != 1 {
-		t.Fatalf("expected error channel capacity to be 1 for reactor 2, got %d", cap(rc2.Errors()))
-	}
-
-	rcMain, err := reactor.New(rc1, rc2)
-	if err != nil {
-		t.Fatalf("unexpected error creating main reactor: %v", err)
-	}
-
-	if cap(rcMain.Errors()) != 2 {
-		t.Fatalf("expected error channel capacity to be 2, got %d", cap(rcMain.Errors()))
-	}
-
-	go rcMain.Start(ctx)
-
-	time.Sleep(100 * time.Millisecond)
-
-	go rcMain.Shutdown(ctx)
-
-	isExpectedErr1Received := false
-	isExpectedErr2Received := false
-	countErr := 0
-	finishTime := time.Now().Add(time.Second)
-
-	for err := range rcMain.Errors() {
-		if time.Now().After(finishTime) {
-			t.Fatal("timeout waiting for errors from workers")
+	for idx := range workers {
+		if workers[idx].shutdownCtx.Load() != ctx {
+			t.Fatalf(
+				"expected worker %d Shutdown context to match the context passed to Shutdown",
+				idx,
+			)
 		}
 
-		if !errors.Is(err, expectErr1) && !errors.Is(err, expectErr2) {
-			t.Fatalf("unexpected error: %v", err)
+		if workers[idx].countShutdownCalls.Load() != 1 {
+			t.Fatalf(
+				"expected worker %d Shutdown to be called once, got %d",
+				idx,
+				workers[idx].countShutdownCalls.Load(),
+			)
 		}
-
-		if errors.Is(err, expectErr1) {
-			isExpectedErr1Received = true
-		}
-
-		if errors.Is(err, expectErr2) {
-			isExpectedErr2Received = true
-		}
-
-		countErr++
 	}
 
-	if !isExpectedErr1Received {
-		t.Fatal("expected error 1 not received")
-	}
-
-	if !isExpectedErr2Received {
-		t.Fatal("expected error 2 not received")
-	}
-
-	if countErr != 2 {
-		t.Fatalf("expected 2 errors, got %d", countErr)
-	}
-
-	if work1.countStartCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Start to be called once for worker 1, but it was called %d times",
-			work1.countStartCalls.Load(),
-		)
-	}
-
-	if work2.countStartCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Start to be called once for worker 2, but it was called %d times",
-			work2.countStartCalls.Load(),
-		)
-	}
-
-	if work1.countShutdownCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Shutdown to be called once for worker 1, but it was called %d times",
-			work1.countShutdownCalls.Load(),
-		)
-	}
-
-	if work2.countShutdownCalls.Load() != 1 {
-		t.Fatalf(
-			"expected Shutdown to be called once for worker 2, but it was called %d times",
-			work2.countShutdownCalls.Load(),
-		)
-	}
-
-	if work1.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 1")
-	}
-
-	if work2.startCtx.Load() != ctx {
-		t.Fatal("unexpected context passed to Start for worker 2")
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
 	}
 }
 
-// TestReactor_ManyWorkers verifies scalability with launching and proper handling
-// of 100 workers with error aggregation into a single channel.
-func TestReactor_ManyWorkers(t *testing.T) {
+func TestReactor_Shutdown_MultipleWorkersFullErrorsChannel(t *testing.T) {
 	t.Parallel()
 
-	expectErr := errors.New("test error")
-	ctx := context.WithValue(context.Background(), testKey{}, "test-value")
-
-	workers := make([]reactor.Worker, 100)
+	expectedErr := errors.New("worker error")
+	workers := make([]*mockWorker, 1000)
+	ctx := context.Background()
 
 	for idx := range workers {
-		work := new(mockWorker)
-		work.errCh = make(chan error, 1)
-		work.timeLifeStarted = 300 * time.Millisecond
-
-		work.timeLifeShutdown = 100 * time.Millisecond
-		work.errCh <- expectErr
-
-		workers[idx] = work
+		workers[idx] = new(mockWorker)
+		workers[idx].shutdownErr = expectedErr
+		workers[idx].timeLifeStarted = 200 * time.Millisecond
+		workers[idx].timeLifeShutdown = time.Duration(idx) * time.Microsecond
 	}
 
-	rc, err := reactor.New(workers...)
+	react, err := reactor.New(reactor.WithErrorBufferSize(10))
 	if err != nil {
-		t.Fatalf("unexpected error creating reactor: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if cap(rc.Errors()) != 100 {
-		t.Fatalf("expected error channel capacity to be 100, got %d", cap(rc.Errors()))
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
 	}
 
-	go rc.Start(ctx)
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		err := react.Start(ctx)
+		if err == nil {
+			t.Fatalf("expected error from Start, got %v", err)
+		}
+
+		if !errors.Is(err, reactor.ErrChannelFull) {
+			t.Fatalf("expected error %v from Start, got %v", reactor.ErrChannelFull, err)
+		}
+	})
 
 	time.Sleep(100 * time.Millisecond)
 
-	go rc.Shutdown(ctx)
-
-	countErr := 0
-	finishTime := time.Now().Add(2 * time.Second)
-
-	for err := range rc.Errors() {
-		if time.Now().After(finishTime) {
-			t.Fatal("timeout waiting for errors from workers")
-		}
-
-		if !errors.Is(err, expectErr) {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		countErr++
+	err = react.Shutdown(ctx)
+	if err == nil {
+		t.Fatalf("expected error from Shutdown, got %v", err)
 	}
 
-	if countErr != 100 {
-		t.Fatalf("expected 100 errors, got %d", countErr)
+	if !errors.Is(err, reactor.ErrChannelFull) {
+		t.Fatalf("expected error %v, got %v", reactor.ErrChannelFull, err)
 	}
 
-	for idx, worker := range workers {
-		mockWorker, ok := worker.(*mockWorker)
-		if !ok {
-			t.Fatalf("unexpected worker type at index %d: %T", idx, worker)
+	for idx := range errCh {
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("expected error %v from worker %d, got %v", expectedErr, idx, err)
+			}
+		default:
+			t.Fatalf("expected an error from worker %d in the error channel, but it was empty", idx)
+		}
+	}
+
+	wg.Wait()
+}
+
+func TestReactor_Shutdown_WithLogger(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	mockLogger := new(mockLogger)
+	mockWork := new(mockWorker)
+	mockWork.shutdownErr = expectedErr
+	mockWork.timeLifeStarted = 200 * time.Millisecond
+	ctx := context.Background()
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWork); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(ctx); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := react.Shutdown(ctx); err != nil {
+		t.Fatalf("expected no error from Shutdown, got %v", err)
+	}
+
+	wg.Wait()
+
+	if mockWork.shutdownCtx.Load() != ctx {
+		t.Fatal("expected worker Shutdown context to match the context passed to Shutdown")
+	}
+
+	if mockWork.countShutdownCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Shutdown to be called once, got %d",
+			mockWork.countShutdownCalls.Load(),
+		)
+	}
+
+	if len(errCh) != 1 {
+		t.Fatalf("expected error channel to have exactly one entry, got %d", len(errCh))
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, expectedErr) {
+			t.Fatalf("expected error %v, got %v", expectedErr, err)
+		}
+	default:
+		t.Fatal("expected an error in the error channel, but it was empty")
+	}
+
+	if len(mockLogger.debugLog) != 4 {
+		t.Fatalf("expected exactly four debug log entries, got %d", len(mockLogger.debugLog))
+	}
+
+	if !strings.Contains(
+		mockLogger.debugLog[1].msg,
+		"reactor: shutting down worker",
+	) {
+		t.Fatalf(
+			"expected first debug log message to contain 'reactor: shutting down worker', got '%s'",
+			mockLogger.debugLog[1].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[1].args) != 1 {
+		t.Fatalf(
+			"expected first debug log to have exactly one argument, got %d",
+			len(mockLogger.debugLog[1].args),
+		)
+	}
+
+	args, ok := mockLogger.debugLog[1].args[0].(reactor.LogArgs)
+	if !ok {
+		t.Fatal("expected first debug log argument to be of type reactor.LogArgs")
+	}
+
+	worker, ok := args["worker"]
+	if !ok {
+		t.Fatal("expected first debug log argument to have key 'worker'")
+	}
+
+	mWorker, ok := worker.(*mockWorker)
+	if !ok {
+		t.Fatal("expected 'worker' argument to be of type *mockWorker")
+	}
+
+	if mWorker != mockWork {
+		t.Fatal(
+			"expected 'worker' argument to be the mockWorker instance added to the reactor",
+		)
+	}
+
+	if mockLogger.debugLog[1].ctx != ctx {
+		t.Fatal("expected first debug log context to match the context passed to Shutdown")
+	}
+
+	if !strings.Contains(
+		mockLogger.debugLog[2].msg,
+		"reactor: all workers shut down",
+	) {
+		t.Fatalf(
+			"expected second debug log message to contain 'reactor: all workers shut down', got '%s'",
+			mockLogger.debugLog[2].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[2].args) != 0 {
+		t.Fatalf(
+			"expected second debug log to have no arguments, got %d",
+			len(mockLogger.debugLog[2].args),
+		)
+	}
+
+	if mockLogger.debugLog[2].ctx != ctx {
+		t.Fatal("expected second debug log context to match the context passed to Shutdown")
+	}
+
+	if len(mockLogger.errorLog) != 0 {
+		t.Fatalf("expected no error log entries, got %d", len(mockLogger.errorLog))
+	}
+}
+
+func TestReactor_Shutdown_WithLoggerCancelContext(t *testing.T) {
+	t.Parallel()
+
+	mockLogger := new(mockLogger)
+	mockWork := new(mockWorker)
+	mockWork.timeLifeStarted = 300 * time.Millisecond
+	mockWork.timeLifeShutdown = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if err := react.Add(mockWork); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	errCh := react.Errors()
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		if err := react.Start(context.Background()); err != nil {
+			t.Fatalf("expected no error from Start, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	wg.Go(func() {
+		if err := react.Shutdown(ctx); err != nil {
+			t.Fatalf("expected no error from Shutdown, got %v", err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	wg.Wait()
+
+	if mockWork.shutdownCtx.Load() != ctx {
+		t.Fatal("expected worker Shutdown context to match the context passed to Shutdown")
+	}
+
+	if mockWork.countShutdownCalls.Load() != 1 {
+		t.Fatalf(
+			"expected worker Shutdown to be called once, got %d",
+			mockWork.countShutdownCalls.Load(),
+		)
+	}
+
+	if len(errCh) != 0 {
+		t.Fatalf("expected error channel to be empty, got %d entries", len(errCh))
+	}
+
+	if len(mockLogger.debugLog) != 4 {
+		t.Fatalf("expected exactly four debug log entries, got %d", len(mockLogger.debugLog))
+	}
+
+	if !strings.Contains(
+		mockLogger.debugLog[1].msg,
+		"reactor: shutting down worker",
+	) {
+		t.Fatalf(
+			"expected first debug log message to contain 'reactor: shutting down worker', got '%s'",
+			mockLogger.debugLog[1].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[1].args) != 1 {
+		t.Fatalf(
+			"expected first debug log to have exactly one argument, got %d",
+			len(mockLogger.debugLog[1].args),
+		)
+	}
+
+	args, ok := mockLogger.debugLog[1].args[0].(reactor.LogArgs)
+	if !ok {
+		t.Fatal("expected first debug log argument to be of type reactor.LogArgs")
+	}
+
+	worker, ok := args["worker"]
+	if !ok {
+		t.Fatal("expected first debug log argument to have key 'worker'")
+	}
+
+	mWorker, ok := worker.(*mockWorker)
+	if !ok {
+		t.Fatal("expected 'worker' argument to be of type *mockWorker")
+	}
+
+	if mWorker != mockWork {
+		t.Fatal(
+			"expected 'worker' argument to be the mockWorker instance added to the reactor",
+		)
+	}
+
+	if mockLogger.debugLog[1].ctx != ctx {
+		t.Fatal("expected first debug log context to match the context passed to Shutdown")
+	}
+
+	if !strings.Contains(
+		mockLogger.debugLog[2].msg,
+		"reactor: workers shutdown cancelled by context",
+	) {
+		t.Fatalf(
+			"expected second debug log message to contain 'reactor: workers shutdown cancelled by context', got '%s'",
+			mockLogger.debugLog[2].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[2].args) != 0 {
+		t.Fatalf(
+			"expected second debug log to have no arguments, got %d",
+			len(mockLogger.debugLog[2].args),
+		)
+	}
+
+	if mockLogger.debugLog[2].ctx != ctx {
+		t.Fatal("expected second debug log context to match the context passed to Shutdown")
+	}
+
+	if len(mockLogger.errorLog) != 0 {
+		t.Fatalf("expected no error log entries, got %d", len(mockLogger.errorLog))
+	}
+}
+
+func TestReactor_Shutdown_WithLoggerFullErrorsChannel(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("worker error")
+	mockLogger := new(mockLogger)
+	workers := make([]*mockWorker, 2)
+	ctx := context.Background()
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].shutdownErr = expectedErr
+		workers[idx].timeLifeStarted = 200 * time.Millisecond
+	}
+
+	react, err := reactor.New(reactor.WithLogger(mockLogger), reactor.WithErrorBufferSize(1))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	for idx := range workers {
+		if err := react.Add(workers[idx]); err != nil {
+			t.Fatalf("expected no error when adding worker %d, got %v", idx, err)
+		}
+	}
+
+	wg := &sync.WaitGroup{}
+
+	wg.Go(func() {
+		err := react.Start(ctx)
+		if err == nil {
+			t.Fatalf("expected no error from Start, got %v", err)
 		}
 
-		if mockWorker.countStartCalls.Load() != 1 {
-			t.Fatalf(
-				"expected Start to be called once for worker %d, but it was called %d times",
-				idx,
-				mockWorker.countStartCalls.Load(),
-			)
+		if !errors.Is(err, reactor.ErrChannelFull) {
+			t.Fatalf("expected error %v from Start, got %v", reactor.ErrChannelFull, err)
+		}
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	err = react.Shutdown(ctx)
+	if err == nil {
+		t.Fatalf("expected no error from Shutdown, got %v", err)
+	}
+
+	if !errors.Is(err, reactor.ErrChannelFull) {
+		t.Fatalf("expected error %v from Shutdown, got %v", reactor.ErrChannelFull, err)
+	}
+
+	wg.Wait()
+
+	if len(mockLogger.debugLog) != 4 {
+		t.Fatalf("expected exactly four debug log entries, got %d", len(mockLogger.debugLog))
+	}
+
+	if !strings.Contains(
+		mockLogger.debugLog[2].msg,
+		"reactor: shutting down worker",
+	) {
+		t.Fatalf(
+			"expected debug log message to contain 'reactor: shutting down worker', got '%s'",
+			mockLogger.debugLog[2].msg,
+		)
+	}
+
+	if len(mockLogger.debugLog[2].args) != 1 {
+		t.Fatalf(
+			"expected debug log to have exactly one argument, got %d",
+			len(mockLogger.debugLog[2].args),
+		)
+	}
+
+	args, ok := mockLogger.debugLog[2].args[0].(reactor.LogArgs)
+	if !ok {
+		t.Fatal("expected debug log argument to be of type reactor.LogArgs")
+	}
+
+	worker, ok := args["worker"]
+	if !ok {
+		t.Fatal("expected debug log argument to have key 'worker'")
+	}
+
+	if _, ok := worker.(*mockWorker); !ok {
+		t.Fatal("expected 'worker' argument to be of type *mockWorker")
+	}
+
+	if mockLogger.debugLog[2].ctx != ctx {
+		t.Fatal("expected debug log context to match the context passed to Shutdown")
+	}
+
+	if len(mockLogger.errorLog) != 1 {
+		t.Fatalf("expected exactly one error log entry, got %d", len(mockLogger.errorLog))
+	}
+
+	if !errors.Is(mockLogger.errorLog[0].err, reactor.ErrFailedToSend) {
+		t.Fatalf(
+			"expected error log to contain error %v, got %v",
+			reactor.ErrFailedToSend,
+			mockLogger.errorLog[0].err,
+		)
+	}
+
+	if !errors.Is(mockLogger.errorLog[0].err, expectedErr) {
+		t.Fatalf(
+			"expected error log to contain error %v, got %v",
+			expectedErr,
+			mockLogger.errorLog[0].err,
+		)
+	}
+
+	if mockLogger.errorLog[0].ctx != ctx {
+		t.Fatal("expected error log context to match the context passed to Shutdown")
+	}
+
+	if len(mockLogger.errorLog[0].args) != 0 {
+		t.Fatalf(
+			"expected error log to have no arguments, got %d",
+			len(mockLogger.errorLog[0].args),
+		)
+	}
+}
+
+func TestReactor_Errors_ChannelClosed(t *testing.T) {
+	t.Parallel()
+
+	mockWorker := new(mockWorker)
+	mockWorker.startErr = errors.New("start error")
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	errCh := react.Errors()
+
+	if err := react.Add(mockWorker); err != nil {
+		t.Fatalf("expected no error when adding worker, got %v", err)
+	}
+
+	if err := react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if _, ok := <-errCh; !ok {
+		t.Fatal("expected error channel to be open, but it was closed")
+	}
+
+	if _, ok := <-errCh; ok {
+		t.Fatal("expected error channel to be closed, but it was open")
+	}
+}
+
+func TestReactor_Errors_MultipleWorkers(t *testing.T) {
+	t.Parallel()
+
+	workers := make([]*mockWorker, 2)
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].startErr = errors.New("start error")
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	errCh1 := react.Errors()
+	errCh2 := react.Errors()
+
+	for _, worker := range workers {
+		if err := react.Add(worker); err != nil {
+			t.Fatalf("expected no error when adding worker, got %v", err)
+		}
+	}
+
+	if err := react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	if _, ok := <-errCh1; !ok {
+		t.Fatal("expected first error channel to be open, but it was closed")
+	}
+
+	if _, ok := <-errCh2; !ok {
+		t.Fatal("expected second error channel to be open, but it was closed")
+	}
+
+	if _, ok := <-errCh1; ok {
+		t.Fatal("expected first error channel to be closed, but it was open")
+	}
+
+	if _, ok := <-errCh2; ok {
+		t.Fatal("expected second error channel to be closed, but it was open")
+	}
+}
+
+func TestReactor_Errors_ConcurrentWorkers(t *testing.T) {
+	t.Parallel()
+
+	var errCounter atomic.Int64
+
+	numWorkers := 1000
+	workers := make([]*mockWorker, numWorkers)
+
+	for idx := range workers {
+		workers[idx] = new(mockWorker)
+		workers[idx].startErr = errors.New("start error")
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	wg := &sync.WaitGroup{}
+
+	for range 100 {
+		wg.Go(func() {
+			errCh := react.Errors()
+
+			for {
+				_, ok := <-errCh
+				if !ok {
+					break
+				}
+
+				errCounter.Add(1)
+			}
+		})
+	}
+
+	for _, worker := range workers {
+		if err := react.Add(worker); err != nil {
+			t.Fatalf("expected no error when adding worker, got %v", err)
+		}
+	}
+
+	if err := react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	wg.Wait()
+
+	if errCounter.Load() != int64(numWorkers) {
+		t.Fatalf("expected %d errors, got %d", numWorkers, errCounter.Load())
+	}
+}
+
+func TestReactor_Errors_ConcurrentDynamicWorkers(t *testing.T) {
+	t.Parallel()
+
+	var errCounter atomic.Int64
+
+	workers := make([]*mockFnWorker, 10)
+
+	for idx := range workers {
+		workers[idx] = new(mockFnWorker)
+		workers[idx].errCh = make(chan error, 1)
+		workers[idx].errFn = func(errCh chan error) {
+			for range 100 {
+				errCh <- errors.New("worker error")
+			}
+		}
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	wg := &sync.WaitGroup{}
+
+	for range 100 {
+		wg.Go(func() {
+			errCh := react.Errors()
+
+			for {
+				_, ok := <-errCh
+				if !ok {
+					break
+				}
+
+				errCounter.Add(1)
+			}
+		})
+	}
+
+	for _, worker := range workers {
+		if err := react.Add(worker); err != nil {
+			t.Fatalf("expected no error when adding worker, got %v", err)
+		}
+	}
+
+	if err := react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	wg.Wait()
+
+	expectedErrCount := int64(len(workers) * 100)
+	if errCounter.Load() != expectedErrCount {
+		t.Fatalf("expected %d errors, got %d", expectedErrCount, errCounter.Load())
+	}
+}
+
+func TestReactor_Errors_NestedReactors(t *testing.T) {
+	t.Parallel()
+
+	var errCounter atomic.Int64
+
+	reactors := make([]*reactor.Reactor, 10)
+
+	for idx := range reactors {
+		workers := make([]*mockFnWorker, 10)
+
+		for idx := range workers {
+			workers[idx] = &mockFnWorker{
+				errCh: make(chan error, 1),
+				errFn: func(errCh chan error) {
+					for range 10 {
+						errCh <- errors.New("worker error")
+					}
+				},
+			}
 		}
 
-		if mockWorker.countShutdownCalls.Load() != 1 {
-			t.Fatalf(
-				"expected Shutdown to be called once for worker %d, but it was called %d times",
-				idx,
-				mockWorker.countShutdownCalls.Load(),
-			)
+		react, err := reactor.New()
+		if err != nil {
+			t.Fatalf("expected no error when creating reactor %d, got %v", idx, err)
 		}
 
-		if mockWorker.startCtx.Load() != ctx {
-			t.Fatalf("unexpected context passed to Start for worker %d", idx)
+		if react == nil {
+			t.Fatalf("expected non-nil reactor %d, got nil", idx)
 		}
+
+		for idx := range workers {
+			if err := react.Add(workers[idx]); err != nil {
+				t.Fatalf(
+					"expected no error when adding worker %d to reactor %d, got %v",
+					idx,
+					idx,
+					err,
+				)
+			}
+		}
+
+		reactors[idx] = react
+	}
+
+	react, err := reactor.New()
+	if err != nil {
+		t.Fatalf("expected no error when creating main reactor, got %v", err)
+	}
+
+	if react == nil {
+		t.Fatal("expected non-nil main reactor, got nil")
+	}
+
+	wg := &sync.WaitGroup{}
+
+	for range 100 {
+		wg.Go(func() {
+			errCh := react.Errors()
+
+			for {
+				_, ok := <-errCh
+				if !ok {
+					break
+				}
+
+				errCounter.Add(1)
+			}
+		})
+	}
+
+	for idx := range reactors {
+		if err := react.Add(reactors[idx]); err != nil {
+			t.Fatalf("expected no error when adding reactor %d to main reactor, got %v", idx, err)
+		}
+	}
+
+	if err := react.Start(context.Background()); err != nil {
+		t.Fatalf("expected no error from Start, got %v", err)
+	}
+
+	wg.Wait()
+
+	expectedErrCount := int64(len(reactors) * 10 * 10)
+	if errCounter.Load() != expectedErrCount {
+		t.Fatalf("expected %d errors, got %d", expectedErrCount, errCounter.Load())
 	}
 }
