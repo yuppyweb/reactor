@@ -13,6 +13,7 @@ linters:
     - containedctx
     - contextcheck
     - copyloopvar
+    - clickhouselint
     - cyclop
     - decorder
     - depguard
@@ -46,7 +47,7 @@ linters:
     - godox
     - goheader
     - gomoddirectives
-    - gomodguard
+    - gomodguard_v2
     - goprintffuncname
     - gosec
     - gosmopolitan
