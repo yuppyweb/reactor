@@ -17,11 +17,11 @@ var (
 	ErrNilLogger = errors.New(packageName + ": logger cannot be nil")
 
 	ErrMinErrorBufferSize = fmt.Errorf(
-		packageName+": error buffer size cannot be less than %d", minErrorBufferSize,
+		"%s: error buffer size cannot be less than %d", packageName, minErrorBufferSize,
 	)
 
 	ErrMaxErrorBufferSize = fmt.Errorf(
-		packageName+": error buffer size cannot be greater than %d", maxErrorBufferSize,
+		"%s: error buffer size cannot be greater than %d", packageName, maxErrorBufferSize,
 	)
 )
 
