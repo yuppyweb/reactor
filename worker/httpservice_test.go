@@ -43,8 +43,8 @@ func (m *mockHTTPServer) Shutdown(ctx context.Context) error {
 // Ensure mockHTTPServer implements the HTTPServer interface.
 var _ worker.HTTPServer = (*mockHTTPServer)(nil)
 
-// TestHTTPService_Start verifies that the HTTPService's Start method calls ListenAndServe
-// on the underlying HTTP server and handles errors correctly.
+// TestHTTPService_Start verifies that the HTTPService's Start method
+// calls ListenAndServe on the underlying HTTP server.
 func TestHTTPService_Start(t *testing.T) {
 	t.Parallel()
 

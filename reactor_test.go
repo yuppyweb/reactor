@@ -12,6 +12,7 @@ import (
 	"github.com/yuppyweb/reactor"
 )
 
+// mockWorker is a mock implementation of the reactor.Worker interface for testing purposes.
 type mockWorker struct {
 	startCtx           atomic.Value
 	shutdownCtx        atomic.Value
@@ -26,6 +27,7 @@ type mockWorker struct {
 
 var _ reactor.Worker = (*mockWorker)(nil)
 
+// Start starts the mockWorker and can be configured to return an error or take a certain amount of time.
 func (w *mockWorker) Start(ctx context.Context) error {
 	defer func() {
 		if w.errCh != nil {
@@ -40,6 +42,7 @@ func (w *mockWorker) Start(ctx context.Context) error {
 	return w.startErr
 }
 
+// Shutdown shuts down the mockWorker and can be configured to return an error or take a certain amount of time.
 func (w *mockWorker) Shutdown(ctx context.Context) error {
 	w.shutdownCtx.Store(ctx)
 	w.countShutdownCalls.Add(1)
@@ -48,10 +51,13 @@ func (w *mockWorker) Shutdown(ctx context.Context) error {
 	return w.shutdownErr
 }
 
+// Errors returns the error channel of the mockWorker.
 func (w *mockWorker) Errors() <-chan error {
 	return w.errCh
 }
 
+// mockFnWorker is a mock implementation of the reactor.Worker interface
+// that uses a function callback for error handling.
 type mockFnWorker struct {
 	errFn func(chan error)
 	errCh chan error
@@ -59,6 +65,7 @@ type mockFnWorker struct {
 
 var _ reactor.Worker = (*mockFnWorker)(nil)
 
+// Start starts the mockFnWorker and calls the error callback if provided.
 func (w *mockFnWorker) Start(context.Context) error {
 	defer func() {
 		if w.errCh != nil {
@@ -73,14 +80,18 @@ func (w *mockFnWorker) Start(context.Context) error {
 	return nil
 }
 
+// Shutdown shuts down the mockFnWorker.
 func (w *mockFnWorker) Shutdown(context.Context) error {
 	return nil
 }
 
+// Errors returns the error channel of the mockFnWorker.
 func (w *mockFnWorker) Errors() <-chan error {
 	return w.errCh
 }
 
+// TestNewReactor_WithDefaultErrorBufferSize verifies that a newly created Reactor
+// has a default error buffer size of 1000.
 func TestNewReactor_WithDefaultErrorBufferSize(t *testing.T) {
 	t.Parallel()
 
@@ -98,6 +109,7 @@ func TestNewReactor_WithDefaultErrorBufferSize(t *testing.T) {
 	}
 }
 
+// TestNewReactor_WithCustomErrorBufferSize verifies that a Reactor can be created with custom error buffer sizes.
 func TestNewReactor_WithCustomErrorBufferSize(t *testing.T) {
 	t.Parallel()
 
@@ -137,6 +149,8 @@ func TestNewReactor_WithCustomErrorBufferSize(t *testing.T) {
 	}
 }
 
+// TestNewReactor_WithInvalidErrorBufferSize verifies that creating a Reactor with invalid
+// error buffer sizes returns appropriate errors.
 func TestNewReactor_WithInvalidErrorBufferSize(t *testing.T) {
 	t.Parallel()
 
@@ -166,6 +180,7 @@ func TestNewReactor_WithInvalidErrorBufferSize(t *testing.T) {
 	}
 }
 
+// TestNewReactor_WithNilOption verifies that creating a Reactor with a nil option returns an error.
 func TestNewReactor_WithNilOption(t *testing.T) {
 	t.Parallel()
 
@@ -179,6 +194,8 @@ func TestNewReactor_WithNilOption(t *testing.T) {
 	}
 }
 
+// TestNewReactor_WithOptionError verifies that errors returned from option functions
+// are properly propagated.
 func TestNewReactor_WithOptionError(t *testing.T) {
 	t.Parallel()
 
@@ -197,6 +214,8 @@ func TestNewReactor_WithOptionError(t *testing.T) {
 	}
 }
 
+// TestNewReactor_WithLogger verifies that a Reactor can be created with a custom logger
+// and logging works correctly.
 func TestNewReactor_WithLogger(t *testing.T) {
 	t.Parallel()
 
@@ -240,6 +259,7 @@ func TestNewReactor_WithLogger(t *testing.T) {
 	}
 }
 
+// TestNewReactor_WithNilLogger verifies that passing a nil logger to New returns an error.
 func TestNewReactor_WithNilLogger(t *testing.T) {
 	t.Parallel()
 
@@ -253,6 +273,7 @@ func TestNewReactor_WithNilLogger(t *testing.T) {
 	}
 }
 
+// TestReactor_Add_NilWorker verifies that Add returns an error when passed a nil worker.
 func TestReactor_Add_NilWorker(t *testing.T) {
 	t.Parallel()
 
@@ -275,6 +296,8 @@ func TestReactor_Add_NilWorker(t *testing.T) {
 	}
 }
 
+// TestReactor_Add_IsStarted verifies that Add returns an error when the reactor
+// is already running.
 func TestReactor_Add_IsStarted(t *testing.T) {
 	t.Parallel()
 
@@ -317,6 +340,8 @@ func TestReactor_Add_IsStarted(t *testing.T) {
 	wg.Wait()
 }
 
+// TestReactor_Add_IsStopped verifies that Add returns an error when called after
+// the reactor has been stopped.
 func TestReactor_Add_IsStopped(t *testing.T) {
 	t.Parallel()
 
@@ -347,6 +372,8 @@ func TestReactor_Add_IsStopped(t *testing.T) {
 	}
 }
 
+// TestReactor_Add_Concurrent verifies that multiple workers can be added
+// concurrently without errors.
 func TestReactor_Add_Concurrent(t *testing.T) {
 	t.Parallel()
 
@@ -385,6 +412,8 @@ func TestReactor_Add_Concurrent(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_Restart verifies that starting a reactor that is already started
+// returns an error.
 func TestReactor_Start_Restart(t *testing.T) {
 	t.Parallel()
 
@@ -415,6 +444,8 @@ func TestReactor_Start_Restart(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_SingleWorkerNilErrors verifies that a single worker with
+// no errors is started correctly.
 func TestReactor_Start_SingleWorkerNilErrors(t *testing.T) {
 	t.Parallel()
 
@@ -452,6 +483,8 @@ func TestReactor_Start_SingleWorkerNilErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_SingleWorkerReturnError verifies that errors returned by a single
+// worker's Start method are captured.
 func TestReactor_Start_SingleWorkerReturnError(t *testing.T) {
 	t.Parallel()
 
@@ -500,6 +533,8 @@ func TestReactor_Start_SingleWorkerReturnError(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_SingleWorkerRuntimeErrors verifies that runtime errors from
+// a single worker are captured.
 func TestReactor_Start_SingleWorkerRuntimeErrors(t *testing.T) {
 	t.Parallel()
 
@@ -551,6 +586,8 @@ func TestReactor_Start_SingleWorkerRuntimeErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_SingleWorkerMixedErrors verifies that both return and runtime
+// errors from a single worker are captured.
 func TestReactor_Start_SingleWorkerMixedErrors(t *testing.T) {
 	t.Parallel()
 
@@ -605,6 +642,8 @@ func TestReactor_Start_SingleWorkerMixedErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_MultipleWorkersNilErrors verifies that multiple workers without
+// errors are started correctly.
 func TestReactor_Start_MultipleWorkersNilErrors(t *testing.T) {
 	t.Parallel()
 
@@ -651,6 +690,8 @@ func TestReactor_Start_MultipleWorkersNilErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_MultipleWorkersReturnErrors verifies that errors returned by
+// multiple workers are captured.
 func TestReactor_Start_MultipleWorkersReturnErrors(t *testing.T) {
 	t.Parallel()
 
@@ -710,6 +751,8 @@ func TestReactor_Start_MultipleWorkersReturnErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_MultipleWorkersRuntimeErrors verifies that runtime errors from
+// multiple workers are captured.
 func TestReactor_Start_MultipleWorkersRuntimeErrors(t *testing.T) {
 	t.Parallel()
 
@@ -771,6 +814,8 @@ func TestReactor_Start_MultipleWorkersRuntimeErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_MultipleWorkersMixedErrors verifies that both return and runtime
+// errors from multiple workers are captured.
 func TestReactor_Start_MultipleWorkersMixedErrors(t *testing.T) {
 	t.Parallel()
 
@@ -838,6 +883,8 @@ func TestReactor_Start_MultipleWorkersMixedErrors(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_MultipleWorkersCancelContext verifies that canceling the context
+// stops multiple workers correctly.
 func TestReactor_Start_MultipleWorkersCancelContext(t *testing.T) {
 	t.Parallel()
 
@@ -893,6 +940,8 @@ func TestReactor_Start_MultipleWorkersCancelContext(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_MultipleWorkersFullErrorsChannel verifies that when the error
+// buffer is full, starting the reactor returns ErrChannelFull.
 func TestReactor_Start_MultipleWorkersFullErrorsChannel(t *testing.T) {
 	t.Parallel()
 
@@ -943,6 +992,8 @@ func TestReactor_Start_MultipleWorkersFullErrorsChannel(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_NoWorkers verifies that starting a reactor without workers returns
+// an error.
 func TestReactor_Start_NoWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -967,6 +1018,8 @@ func TestReactor_Start_NoWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_WithLogger verifies that the reactor logs startup messages
+// for each worker.
 func TestReactor_Start_WithLogger(t *testing.T) {
 	t.Parallel()
 
@@ -1053,6 +1106,8 @@ func TestReactor_Start_WithLogger(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_WithLoggerCancelContext verifies that canceling the context
+// during startup is logged appropriately.
 func TestReactor_Start_WithLoggerCancelContext(t *testing.T) {
 	t.Parallel()
 
@@ -1152,6 +1207,8 @@ func TestReactor_Start_WithLoggerCancelContext(t *testing.T) {
 	}
 }
 
+// TestReactor_Start_WithLoggerFullErrorsChannel verifies that when the error buffer
+// is full during startup, a log entry is created.
 func TestReactor_Start_WithLoggerFullErrorsChannel(t *testing.T) {
 	t.Parallel()
 
@@ -1256,6 +1313,8 @@ func TestReactor_Start_WithLoggerFullErrorsChannel(t *testing.T) {
 	}
 }
 
+// TestReactor_Shutdown_NotStarted verifies that shutting down a reactor that
+// was never started returns an error.
 func TestReactor_Shutdown_NotStarted(t *testing.T) {
 	t.Parallel()
 
@@ -1278,6 +1337,8 @@ func TestReactor_Shutdown_NotStarted(t *testing.T) {
 	}
 }
 
+// TestReactor_Shutdown_IsStopped verifies that shutting down a reactor that
+// is already stopped returns an error.
 func TestReactor_Shutdown_IsStopped(t *testing.T) {
 	t.Parallel()
 
@@ -1309,6 +1370,8 @@ func TestReactor_Shutdown_IsStopped(t *testing.T) {
 	}
 }
 
+// TestReactor_Shutdown_SingleWorkerNilErrors verifies that a single worker with
+// no shutdown errors is shut down correctly.
 func TestReactor_Shutdown_SingleWorkerNilErrors(t *testing.T) {
 	t.Parallel()
 
@@ -1358,6 +1421,8 @@ func TestReactor_Shutdown_SingleWorkerNilErrors(t *testing.T) {
 	wg.Wait()
 }
 
+// TestReactor_Shutdown_SingleWorkerReturnError verifies that errors returned
+// by a single worker's Shutdown method are captured.
 func TestReactor_Shutdown_SingleWorkerReturnError(t *testing.T) {
 	t.Parallel()
 
@@ -1418,6 +1483,8 @@ func TestReactor_Shutdown_SingleWorkerReturnError(t *testing.T) {
 	wg.Wait()
 }
 
+// TestReactor_Shutdown_MultipleWorkersNilErrors verifies that multiple workers
+// without shutdown errors are shut down correctly.
 func TestReactor_Shutdown_MultipleWorkersNilErrors(t *testing.T) {
 	t.Parallel()
 
@@ -1479,6 +1546,8 @@ func TestReactor_Shutdown_MultipleWorkersNilErrors(t *testing.T) {
 	wg.Wait()
 }
 
+// TestReactor_Shutdown_MultipleWorkersReturnErrors verifies that errors
+// returned by multiple workers' Shutdown methods are captured.
 func TestReactor_Shutdown_MultipleWorkersReturnErrors(t *testing.T) {
 	t.Parallel()
 
@@ -1553,6 +1622,8 @@ func TestReactor_Shutdown_MultipleWorkersReturnErrors(t *testing.T) {
 	wg.Wait()
 }
 
+// TestReactor_Shutdown_MultipleWorkersCancelContext verifies that canceling
+// the context during shutdown is handled correctly.
 func TestReactor_Shutdown_MultipleWorkersCancelContext(t *testing.T) {
 	t.Parallel()
 
@@ -1617,6 +1688,8 @@ func TestReactor_Shutdown_MultipleWorkersCancelContext(t *testing.T) {
 	}
 }
 
+// TestReactor_Shutdown_MultipleWorkersFullErrorsChannel verifies that when
+// the error buffer is full during shutdown, ErrChannelFull is returned.
 func TestReactor_Shutdown_MultipleWorkersFullErrorsChannel(t *testing.T) {
 	t.Parallel()
 
@@ -1681,6 +1754,8 @@ func TestReactor_Shutdown_MultipleWorkersFullErrorsChannel(t *testing.T) {
 	wg.Wait()
 }
 
+// TestReactor_Shutdown_WithLogger verifies that the reactor logs shutdown
+// messages for each worker.
 func TestReactor_Shutdown_WithLogger(t *testing.T) {
 	t.Parallel()
 
@@ -1813,6 +1888,8 @@ func TestReactor_Shutdown_WithLogger(t *testing.T) {
 	}
 }
 
+// TestReactor_Shutdown_WithLoggerCancelContext verifies that canceling the
+// context during shutdown is logged appropriately.
 func TestReactor_Shutdown_WithLoggerCancelContext(t *testing.T) {
 	t.Parallel()
 
@@ -1940,6 +2017,8 @@ func TestReactor_Shutdown_WithLoggerCancelContext(t *testing.T) {
 	}
 }
 
+// TestReactor_Shutdown_WithLoggerFullErrorsChannel verifies that when the
+// error buffer is full during shutdown, a log entry is created.
 func TestReactor_Shutdown_WithLoggerFullErrorsChannel(t *testing.T) {
 	t.Parallel()
 
@@ -2062,6 +2141,8 @@ func TestReactor_Shutdown_WithLoggerFullErrorsChannel(t *testing.T) {
 	}
 }
 
+// TestReactor_Errors_ChannelClosed verifies that the error channel is closed
+// after the reactor completes.
 func TestReactor_Errors_ChannelClosed(t *testing.T) {
 	t.Parallel()
 
@@ -2092,6 +2173,8 @@ func TestReactor_Errors_ChannelClosed(t *testing.T) {
 	}
 }
 
+// TestReactor_Errors_MultipleWorkers verifies that multiple error channels
+// from the same reactor all receive the same errors.
 func TestReactor_Errors_MultipleWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -2137,6 +2220,8 @@ func TestReactor_Errors_MultipleWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_Errors_ConcurrentWorkers verifies that concurrent readers of
+// the error channel all receive errors correctly.
 func TestReactor_Errors_ConcurrentWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -2189,6 +2274,8 @@ func TestReactor_Errors_ConcurrentWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_Errors_ConcurrentDynamicWorkers verifies that workers sending
+// multiple errors concurrently are handled correctly.
 func TestReactor_Errors_ConcurrentDynamicWorkers(t *testing.T) {
 	t.Parallel()
 
@@ -2246,6 +2333,8 @@ func TestReactor_Errors_ConcurrentDynamicWorkers(t *testing.T) {
 	}
 }
 
+// TestReactor_Errors_NestedReactors verifies that nested reactors properly
+// propagate errors through the error channel.
 func TestReactor_Errors_NestedReactors(t *testing.T) {
 	t.Parallel()
 

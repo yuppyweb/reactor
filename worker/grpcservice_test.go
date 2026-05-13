@@ -40,7 +40,8 @@ func (m *mockGRPCServer) GracefulStop() {
 // Ensure mockGRPCServer implements the GRPCServer interface.
 var _ worker.GRPCServer = (*mockGRPCServer)(nil)
 
-// Ensure mockGRPCServer implements the GRPCServer interface.
+// TestGRPCService_Start verifies that the GRPCService's Start method
+// calls Serve on the underlying gRPC server.
 func TestGRPCService_Start(t *testing.T) {
 	t.Parallel()
 
