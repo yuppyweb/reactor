@@ -92,8 +92,13 @@ func TestMain(m *testing.M) {
 }
 
 // TestStartReturnsOnSignal checks that Start in a child process returns
-// when CTRL_BREAK is delivered to that process.
+// when CTRL_BREAK is delivered to that process. It is skipped with -short
+// because every run starts a new process.
 func TestStartReturnsOnSignal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a child process")
+	}
+
 	t.Parallel()
 
 	helper := startSignalHelper(t)

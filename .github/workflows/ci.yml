@@ -82,7 +82,7 @@ jobs:
           cache: true
       - name: Run tests 1000 times
         shell: bash
-        run: go test --count=1000 -race -failfast ./...
+        run: go test --count=1000 -race -failfast -short ./...
 
   required:
     name: Required
