@@ -194,11 +194,12 @@ func sendCtrlBreak(pid int) error {
 // prints ready, and returns when trap.Start returns.
 func waitForInterrupt() error {
 	// Notify before Start so an early CTRL_BREAK is delivered here and does
-	// not run the default terminate action.
+	// not run the default terminate action. The channel is never stopped:
+	// the test keeps sending CTRL_BREAK until the process exits, and an
+	// event after signal.Stop would end it with STATUS_CONTROL_C_EXIT.
 	ready := make(chan os.Signal, 1)
 
 	signal.Notify(ready, os.Interrupt)
-	defer signal.Stop(ready)
 
 	if _, err := os.Stdout.WriteString("ready\n"); err != nil {
 		return fmt.Errorf("write ready: %w", err)
