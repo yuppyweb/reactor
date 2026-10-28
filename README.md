@@ -10,7 +10,7 @@
 ✅ **One Worker Interface** — Start and stop any unit of work the same way  
 ✅ **First Result Wins** — `Start` returns the earliest result and discards the rest  
 ✅ **Concurrent Stop** — `Stop` runs every worker at the same time and waits  
-✅ **Panic Recovery** — A panic is raised again after the other workers have stopped  
+✅ **Panic Recovery** — A panic is raised again after the other workers have finished  
 ✅ **Nested Groups** — A reactor implements `Worker`, so one group can contain another  
 ✅ **Built-in Workers** — `runner`, `closer`, and `trap` for functions, resources, and signals  
 ✅ **Fixed Membership** — The worker list is copied in `New` and stays fixed  
@@ -116,7 +116,7 @@ type Worker interface {
 }
 ```
 
-`Start` runs until the work finishes. `Stop` asks it to finish. A parent reactor calls `Start` once per `Start` and `Stop` once per `Stop`. The two calls may run at the same time, so an implementation has to allow `Stop` while `Start` is in progress.
+`Start` runs until the work finishes. `Stop` asks it to finish. A parent reactor calls `Start` once per `Start`. It calls `Stop` once per `Stop` and once more after `Start` receives the first result, so a worker usually sees more than one `Stop`. These calls may run at the same time as `Start` and as each other, so an implementation has to allow `Stop` while `Start` is in progress and a repeated `Stop`. `Start` must return after `Stop`, even when `Stop` panicked, or the parent's `Start` blocks.
 
 The concrete reactor type stays inside the package. Callers receive `Worker`.
 
@@ -138,7 +138,7 @@ Membership is fixed after `New`. Add another worker by building a new group, or 
 err := app.Start()
 ```
 
-A panic in a worker's `Start` is recovered. `Stop` still runs, and the panic is raised again after the other workers have stopped. When more than one worker panics, one recovered value is raised. The raised panic takes the place of a returned error, including when another worker already finished with an error. A panic during the `Stop` that follows the first result is raised from that `Stop`, after the other `Stop` calls finish.
+A panic in a worker's `Start` is recovered. `Stop` still runs, and the panic is raised again after the other workers have stopped. When more than one worker panics, one recovered value is raised. The raised panic takes the place of a returned error, including when another worker already finished with an error. A panic during the `Stop` that follows the first result is also recovered. `Start` still waits for every worker and then raises it. A panic in a worker's `Start` takes precedence over a panic in `Stop`. A worker that exits through `runtime.Goexit` counts as a nil result.
 
 `Start` blocks for the whole lifetime of the group. Call `Stop` from another goroutine when the group should end before a worker returns on its own. `trap` is the usual way to do that from an operating system signal.
 
@@ -189,6 +189,8 @@ work, err := runner.New(func(stop <-chan struct{}) error {
 
 `Stop` before `Start` is safe. `Start` then returns the stored close error.
 
+If `Close` panics, the panic propagates from `Stop`. `Start` is still unblocked and returns nil, and a later `Stop` does not call `Close` again.
+
 A nil resource returns `ErrNilCloser`.
 
 Inside a group, that close error is the value `Start` returns when the closer finishes first. When another worker finishes first, the close error is discarded with every other later result. The resource is still closed once.
@@ -207,7 +209,7 @@ shutdown, err := closer.New(listener)
 
 ### Trap 📡
 
-`trap` waits until one configured signal arrives or `Stop` is called. Both outcomes return nil, so a trap alone does not fail the group. `signal.Stop` runs when `Start` returns, and the process stops delivering those signals to this worker.
+`trap` waits until one configured signal arrives or `Stop` is called. Both outcomes return nil, so a trap alone does not fail the group. `signal.Stop` runs when `Start` returns, and the process stops delivering those signals to this worker. When no other channel is registered for a signal, its default action applies again, so a second interrupt during shutdown ends the process.
 
 The signal list is copied. Later changes to the caller's slice leave the trap unchanged. An empty list returns `ErrNoSignals`. A nil signal returns `ErrNilSignal`. The handler is installed in `Start`.
 

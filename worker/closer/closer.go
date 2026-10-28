@@ -66,10 +66,13 @@ func (cl *closer) Start() error {
 // Stop closes the resource and unblocks Start.
 //
 // A second call does nothing. The error from Close is stored for Start.
-// Stop does not wait for Start to read it.
+// Stop does not wait for Start to read it. If Close panics, the panic
+// propagates from Stop, Start is still unblocked and returns nil, and
+// later calls do not call Close again.
 func (cl *closer) Stop() {
 	cl.once.Do(func() {
+		defer close(cl.stop)
+
 		cl.err = cl.resource.Close()
-		close(cl.stop)
 	})
 }

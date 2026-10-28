@@ -2,12 +2,16 @@ package reactor_test
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yuppyweb/reactor"
 )
+
+// stopPanicked is the value a stub Stop panics with.
+const stopPanicked = "stop panicked"
 
 // stub is a Worker that counts Start and Stop and calls optional hooks.
 type stub struct {
@@ -446,7 +450,7 @@ func TestStartPanicOverridesWorkerError(t *testing.T) {
 func TestStartPanicsWhenStopPanics(t *testing.T) {
 	t.Parallel()
 
-	sentinel := "stop panicked"
+	sentinel := stopPanicked
 	worker := newStub(func() error { return nil }, func() {
 		panic(sentinel)
 	})
@@ -455,6 +459,130 @@ func TestStartPanicsWhenStopPanics(t *testing.T) {
 	requirePanic(t, sentinel, func() {
 		_ = group.Start()
 	})
+}
+
+// TestStartWaitsWhenStopPanics checks that a panic in Stop during Start
+// is raised only after every worker has finished.
+func TestStartWaitsWhenStopPanics(t *testing.T) {
+	t.Parallel()
+
+	sentinel := stopPanicked
+	stopped := make(chan struct{})
+	release := make(chan struct{})
+
+	var stopOnce, releaseOnce sync.Once
+
+	closeRelease := func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	}
+
+	fast := newStub(func() error { return nil }, nil)
+	slow := newStub(func() error {
+		<-release
+
+		return nil
+	}, func() {
+		stopOnce.Do(func() {
+			close(stopped)
+		})
+
+		panic(sentinel)
+	})
+	group := mustNew(t, fast, slow)
+
+	t.Cleanup(closeRelease)
+
+	done := make(chan any, 1)
+
+	go func() {
+		got, _ := catch(func() {
+			_ = group.Start()
+		})
+
+		done <- got
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("slow worker was not stopped")
+	}
+
+	select {
+	case got := <-done:
+		t.Fatalf("start returned before slow worker finished: %v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	closeRelease()
+
+	select {
+	case got := <-done:
+		if got != sentinel {
+			t.Fatalf("panic %v, want %v", got, sentinel)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("start did not return")
+	}
+}
+
+// TestStartPanicOverridesStopPanic checks that a panic in a worker's Start
+// is raised instead of a panic in another worker's Stop.
+func TestStartPanicOverridesStopPanic(t *testing.T) {
+	t.Parallel()
+
+	startSentinel := "start panicked"
+	stopSentinel := stopPanicked
+	stopped := make(chan struct{})
+
+	var once sync.Once
+
+	panicking := newStub(func() error {
+		panic(startSentinel)
+	}, nil)
+	blocked := newStub(func() error {
+		<-stopped
+
+		return nil
+	}, func() {
+		once.Do(func() {
+			close(stopped)
+		})
+
+		panic(stopSentinel)
+	})
+	group := mustNew(t, panicking, blocked)
+
+	requirePanic(t, startSentinel, func() {
+		_ = group.Start()
+	})
+
+	if panicking.Stops() != 1 || blocked.Stops() != 1 {
+		t.Fatalf("stops %d and %d, want 1 and 1", panicking.Stops(), blocked.Stops())
+	}
+}
+
+// TestStartGoexitCountsAsNil checks that a worker that exits through
+// runtime.Goexit gives a nil result and does not block Start.
+func TestStartGoexitCountsAsNil(t *testing.T) {
+	t.Parallel()
+
+	worker := newStub(func() error {
+		runtime.Goexit()
+
+		return nil
+	}, nil)
+	group := mustNew(t, worker)
+
+	if err := awaitStart(t, group); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	if worker.Stops() != 1 {
+		t.Fatalf("stops %d, want 1", worker.Stops())
+	}
 }
 
 // TestStopCallsEveryWorker checks that Stop calls Stop on every worker.
@@ -541,7 +669,7 @@ func TestStopRunsConcurrently(t *testing.T) {
 func TestStopRepanics(t *testing.T) {
 	t.Parallel()
 
-	sentinel := "stop panicked"
+	sentinel := stopPanicked
 	panicking := newStub(nil, func() {
 		panic(sentinel)
 	})

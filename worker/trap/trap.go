@@ -70,8 +70,10 @@ func New(signals ...os.Signal) (reactor.Worker, error) {
 // Start waits until a signal arrives or Stop is called.
 //
 // Both outcomes return nil. signal.Stop is called when Start returns,
-// so the process no longer delivers those signals to this worker. Stop
-// before Start is safe: Start returns nil without waiting.
+// so the process no longer delivers those signals to this worker. When
+// no other channel is registered for a signal, its default action applies
+// again: a second interrupt during shutdown ends the process. Stop before
+// Start is safe: Start returns nil without waiting.
 func (tr *trap) Start() error {
 	signalCh := make(chan os.Signal, 1)
 

@@ -64,12 +64,10 @@ func TestStopBeforeStart(t *testing.T) {
 func TestStopUnblocksStart(t *testing.T) {
 	t.Parallel()
 
-	created, err := trap.New(os.Interrupt)
+	worker, err := trap.New(os.Interrupt)
 	if err != nil {
 		t.Fatalf("new trap: %v", err)
 	}
-
-	worker := created
 
 	done := make(chan error, 1)
 

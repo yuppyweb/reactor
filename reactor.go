@@ -4,7 +4,7 @@
 // returns the first result. It then stops the group and waits until the
 // remaining workers finish. Later results are discarded. Stop stops every
 // worker. A panic in Start or Stop is recovered and raised again after the
-// other workers have been stopped.
+// other workers have finished.
 //
 // Reactor implements Worker, so one reactor can be a worker of another.
 package reactor
@@ -25,9 +25,12 @@ var (
 // Worker is one unit of work with a start and a stop.
 //
 // Start runs until the work finishes. Stop asks it to finish. Reactor
-// calls Start once per Start and Stop once per Stop. The two calls may
-// run at the same time. Reactor recovers a panic in either method and
-// raises it again after the other workers are stopped.
+// calls Start once per Start. It calls Stop once per Stop and once more
+// after Start receives the first result, so Stop is usually called more
+// than once and may run at the same time as Start or another Stop.
+// Reactor recovers a panic in either method and raises it again after the
+// other workers have finished. Start must still return after Stop, even
+// when Stop panicked, or the reactor's Start blocks.
 type Worker interface {
 	// Start runs the worker and returns when it finishes.
 	Start() error
@@ -78,29 +81,33 @@ func New(workers ...Worker) (Worker, error) {
 //
 // A panic in a worker's Start is recovered. Stop still runs, and the
 // panic is raised again instead of being returned. If more than one
-// worker panics, one recovered value is raised. A panic in Stop is also
-// raised again, from the Stop call, after the other Stop calls finish.
+// worker panics, one recovered value is raised. A panic in a worker's
+// Stop is also recovered. Start still waits for every worker, then raises
+// it again. A panic in Start takes precedence over a panic in Stop. A
+// worker that returns through runtime.Goexit counts as a nil result.
 func (r *reactor) Start() error {
 	errCh := make(chan error, len(r.workers))
 	panicCh := make(chan any, len(r.workers))
 
 	for _, worker := range r.workers {
 		go func() {
+			var err error
+
 			defer func() {
 				if rec := recover(); rec != nil {
 					panicCh <- rec
-
-					errCh <- nil
 				}
+
+				errCh <- err
 			}()
 
-			errCh <- worker.Start()
+			err = worker.Start()
 		}()
 	}
 
 	err := <-errCh
 
-	r.Stop()
+	stopPanic := r.stop()
 
 	for i := 1; i < cap(errCh); i++ {
 		<-errCh
@@ -112,6 +119,10 @@ func (r *reactor) Start() error {
 	default:
 	}
 
+	if stopPanic != nil {
+		panic(stopPanic)
+	}
+
 	return err
 }
 
@@ -121,6 +132,15 @@ func (r *reactor) Start() error {
 // A panic in a worker's Stop is recovered. The other Stop calls still
 // finish, and one recovered value is raised again.
 func (r *reactor) Stop() {
+	if rec := r.stop(); rec != nil {
+		panic(rec)
+	}
+}
+
+// stop calls Stop on every worker at the same time and waits until every
+// call returns. It returns one recovered panic value, or nil when no Stop
+// panicked.
+func (r *reactor) stop() any {
 	wg := sync.WaitGroup{}
 	panicCh := make(chan any, len(r.workers))
 
@@ -140,7 +160,9 @@ func (r *reactor) Stop() {
 
 	select {
 	case rec := <-panicCh:
-		panic(rec)
+		return rec
 	default:
 	}
+
+	return nil
 }

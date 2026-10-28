@@ -19,8 +19,12 @@ permissions:
 
 jobs:
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -29,6 +33,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run tests
+        shell: bash
         run: |
           go test --count=1 -race -v -coverprofile=cover.out ./...
           go tool cover -func=cover.out
@@ -62,8 +67,12 @@ jobs:
         run: go tool govulncheck -show=color -test ./...
 
   flaky:
-    name: Flaky tests
-    runs-on: ubuntu-latest
+    name: Flaky tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
@@ -72,7 +81,8 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run tests 1000 times
-        run: go test --count=1000 -failfast ./...
+        shell: bash
+        run: go test --count=1000 -race -failfast ./...
 
   required:
     name: Required

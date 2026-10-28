@@ -3,12 +3,12 @@ version: '3'
 tasks:
   fix:
     cmds:
-      - golangci-lint run --fix --color=always 
+      - go tool golangci-lint run --fix --color=always 
     desc: Automatically fix linting issues
 
   lint:
     cmds:
-      - golangci-lint run --color=always
+      - go tool golangci-lint run --color=always
     desc: Run golangci-lint on the codebase
 
   test:
@@ -23,10 +23,10 @@ tasks:
   test-1000:
     cmds:
       - go test --count=1000 -failfast ./...
-    desc: Run tests 100 times to catch flakiness
+    desc: Run tests 1000 times to catch flakiness
 
   vuln:
     cmds:
-      - govulncheck -show=color -test ./...
+      - go tool govulncheck -show=color -test ./...
     desc: Run Go vulnerability checker
     

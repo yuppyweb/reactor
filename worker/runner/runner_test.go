@@ -2,6 +2,7 @@ package runner_test
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,5 +103,92 @@ func TestStopUnblocksStart(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("start did not return")
+	}
+}
+
+// TestStopDoesNotWaitForFunc checks that Stop returns while the function
+// is still running after the stop channel is closed.
+func TestStopDoesNotWaitForFunc(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	worker, err := runner.New(func(stop <-chan struct{}) error {
+		close(entered)
+
+		<-stop
+		<-release
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("new runner: %v", err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- worker.Start()
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("function did not start")
+	}
+
+	stopped := make(chan struct{})
+
+	go func() {
+		worker.Stop()
+
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stop waited for the function")
+	}
+
+	close(release)
+
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("start did not return")
+	}
+}
+
+// TestConcurrentStop checks that Stop called from several goroutines at
+// once closes the stop channel once without a panic.
+func TestConcurrentStop(t *testing.T) {
+	t.Parallel()
+
+	const callers = 8
+
+	worker, err := runner.New(func(stop <-chan struct{}) error {
+		<-stop
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("new runner: %v", err)
+	}
+
+	wg := sync.WaitGroup{}
+
+	for range callers {
+		wg.Go(worker.Stop)
+	}
+
+	wg.Wait()
+
+	if err = worker.Start(); err != nil {
+		t.Fatalf("start: %v", err)
 	}
 }

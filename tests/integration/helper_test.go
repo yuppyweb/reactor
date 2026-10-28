@@ -47,6 +47,16 @@ func (rc *recordingCloser) Closes() int {
 	return rc.closes
 }
 
+// panicCloser panics with a fixed value from Close.
+type panicCloser struct {
+	value any
+}
+
+// Close panics with the fixed value.
+func (pc panicCloser) Close() error {
+	panic(pc.value)
+}
+
 // mustRunner returns a runner for task or fails the test.
 func mustRunner(t *testing.T, task runner.Run) reactor.Worker {
 	t.Helper()

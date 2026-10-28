@@ -112,6 +112,29 @@ func TestStack_PanicInRunnerStillCloses(t *testing.T) {
 	requireClosedOnce(t, resource)
 }
 
+// TestStack_CloserPanicStillStopsRunner checks that a panic in Close is
+// raised from Start only after the runner has stopped.
+func TestStack_CloserPanicStillStopsRunner(t *testing.T) {
+	t.Parallel()
+
+	sentinel := "close panicked"
+	task, stopped := blockUntilStop()
+	group := mustReactor(
+		t,
+		mustRunner(t, func(<-chan struct{}) error {
+			return nil
+		}),
+		mustRunner(t, task),
+		mustCloser(t, panicCloser{value: sentinel}),
+	)
+
+	requirePanic(t, sentinel, func() {
+		_ = group.Start()
+	})
+
+	requireStopped(t, stopped)
+}
+
 // TestStack_NestedReactorStopsInnerRunner checks that stopping the outer
 // reactor stops an inner runner and closes the resource once.
 func TestStack_NestedReactorStopsInnerRunner(t *testing.T) {

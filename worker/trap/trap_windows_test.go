@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -18,6 +19,34 @@ import (
 
 // signalHelperVar selects the child process that waits for os.Interrupt.
 const signalHelperVar = "REACTOR_TRAP_SIGNAL_HELPER"
+
+// lockedBuffer is a bytes.Buffer that is safe to write from the exec
+// copy goroutine while the test reads it.
+type lockedBuffer struct {
+	buf bytes.Buffer
+	mu  sync.Mutex
+}
+
+// Write appends p to the buffer.
+func (lb *lockedBuffer) Write(p []byte) (int, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	n, err := lb.buf.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("write stderr: %w", err)
+	}
+
+	return n, nil
+}
+
+// String returns the buffered output.
+func (lb *lockedBuffer) String() string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	return lb.buf.String()
+}
 
 // TestMain runs the signal helper when signalHelperVar is set.
 // Otherwise it runs the tests.
@@ -49,7 +78,7 @@ func TestStartReturnsOnSignal(t *testing.T) {
 
 // startSignalHelper starts the helper process and waits until it prints
 // ready.
-func startSignalHelper(t *testing.T) (*exec.Cmd, *bytes.Buffer, <-chan struct{}) {
+func startSignalHelper(t *testing.T) (*exec.Cmd, *lockedBuffer, <-chan struct{}) {
 	t.Helper()
 
 	//nolint:gosec // The executable is this test binary.
@@ -66,12 +95,15 @@ func startSignalHelper(t *testing.T) (*exec.Cmd, *bytes.Buffer, <-chan struct{})
 		t.Fatalf("stdout: %v", err)
 	}
 
-	stderr := new(bytes.Buffer)
+	stderr := new(lockedBuffer)
 	cmd.Stderr = stderr
 
 	if err = cmd.Start(); err != nil {
 		t.Fatalf("start helper: %v", err)
 	}
+
+	// Wait closes stdout, so the ready line is read before Wait starts.
+	ready, readErr := bufio.NewReader(stdout).ReadString('\n')
 
 	exited := make(chan struct{})
 
@@ -82,16 +114,13 @@ func startSignalHelper(t *testing.T) (*exec.Cmd, *bytes.Buffer, <-chan struct{})
 	}()
 
 	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		_ = cmd.Process.Kill()
 
 		<-exited
 	})
 
-	ready, err := bufio.NewReader(stdout).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read ready: %v: %s", err, stderr.String())
+	if readErr != nil {
+		t.Fatalf("read ready: %v: %s", readErr, stderr.String())
 	}
 
 	if ready != "ready\n" {
@@ -102,7 +131,7 @@ func startSignalHelper(t *testing.T) (*exec.Cmd, *bytes.Buffer, <-chan struct{})
 }
 
 // signalUntilExit sends CTRL_BREAK until the helper process exits.
-func signalUntilExit(t *testing.T, cmd *exec.Cmd, stderr *bytes.Buffer, exited <-chan struct{}) {
+func signalUntilExit(t *testing.T, cmd *exec.Cmd, stderr *lockedBuffer, exited <-chan struct{}) {
 	t.Helper()
 
 	deadline := time.NewTimer(time.Second)
@@ -140,7 +169,7 @@ func signalUntilExit(t *testing.T, cmd *exec.Cmd, stderr *bytes.Buffer, exited <
 
 // requireHelperSuccess fails the test unless the helper exits with
 // status 0.
-func requireHelperSuccess(t *testing.T, cmd *exec.Cmd, stderr *bytes.Buffer) {
+func requireHelperSuccess(t *testing.T, cmd *exec.Cmd, stderr *lockedBuffer) {
 	t.Helper()
 
 	if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 0 {
