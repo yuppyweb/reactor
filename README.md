@@ -1,22 +1,40 @@
 # ⚛️ Reactor
 
-[![Go Version](https://img.shields.io/github/go-mod/go-version/yuppyweb/reactor)](https://github.com/yuppyweb/reactor)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yuppyweb/reactor)](https://goreportcard.com/report/github.com/yuppyweb/reactor)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/yuppyweb/reactor)](https://github.com/yuppyweb/reactor) 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT) 
 
-**Reactor** is a Go library that implements a lifecycle coordination pattern for managing multiple concurrent workers. It enables you to start and gracefully shut down multiple workers simultaneously with proper context propagation and unified error handling.
-
-Perfect for microservice architectures where you need to manage multiple services (HTTP, gRPC, custom workers) on a single server.
+**Reactor** is a Go library that runs a group of workers together. `Start` runs every worker, returns the first result, and stops the rest. `Stop` stops every worker. A reactor is itself a worker, so groups nest.
 
 ## ✨ Features
 
-✅ **Lifecycle Management** — Add, start, and gracefully stop workers in a controlled manner  
-✅ **Concurrency Safety** — Thread-safe design using `sync.Mutex`, `sync.WaitGroup`, and `atomic`  
-✅ **Unified Error Handling** — All worker errors are collected into a single channel with configurable buffer  
-✅ **Context Propagation** — Full support for `context.Context` for timeouts and cancellation  
-✅ **Composability** — Reactor itself implements the Worker interface, allowing nested reactors  
-✅ **Custom Logging** — Pluggable logger interface for debug and error logging  
-✅ **Built-in Helpers** — Includes `GRPCService` and `HTTPService` workers for common use cases  
+✅ **One Worker Interface** — Start and stop any unit of work the same way  
+✅ **First Result Wins** — `Start` returns the earliest result and discards the rest  
+✅ **Concurrent Stop** — `Stop` runs every worker at the same time and waits  
+✅ **Panic Recovery** — A panic is raised again after the other workers have stopped  
+✅ **Nested Groups** — A reactor implements `Worker`, so one group can contain another  
+✅ **Built-in Workers** — `runner`, `closer`, and `trap` for functions, resources, and signals  
+✅ **Fixed Membership** — The worker list is copied in `New` and stays fixed  
+
+## 🎯 Core Idea
+
+Application code depends on `reactor.Worker`. `New` turns a list of workers into one worker with the same interface. Built-in workers cover a function, an `io.Closer`, and operating system signals. A custom type can implement `Worker` directly.
+
+```
+┌─ Your process
+│
+├─ reactor.Worker ◄──── one group, also a worker
+│
+├─ Start
+│  • run every worker at once
+│  • return the first result
+│  • stop the rest and wait
+│
+└─ Workers
+   • runner — a function until stop
+   • closer — close an io.Closer on Stop
+   • trap   — wait for an OS signal
+   • your own Worker
+```
 
 ## 📦 Installation
 
@@ -24,532 +42,332 @@ Perfect for microservice architectures where you need to manage multiple service
 go get github.com/yuppyweb/reactor
 ```
 
+Import the worker packages you use:
+
+```go
+import (
+    "github.com/yuppyweb/reactor"
+    "github.com/yuppyweb/reactor/worker/closer"
+    "github.com/yuppyweb/reactor/worker/runner"
+    "github.com/yuppyweb/reactor/worker/trap"
+)
+```
+
 ## 🚀 Quick Start
+
+`Start` blocks until the signal arrives or the runner returns. The first of those results is what `Start` returns. `Stop` then closes the file and unblocks the runner.
 
 ```go
 package main
 
 import (
-	"context"
-	"log"
-	"net/http"
-	"time"
+    "log"
+    "os"
 
-	"github.com/yuppyweb/reactor"
-	"github.com/yuppyweb/reactor/worker"
+    "github.com/yuppyweb/reactor"
+    "github.com/yuppyweb/reactor/worker/closer"
+    "github.com/yuppyweb/reactor/worker/runner"
+    "github.com/yuppyweb/reactor/worker/trap"
 )
 
 func main() {
-	// Create reactor
-	r, err := reactor.New()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Create and add HTTP server
-	httpServer := &http.Server{Addr: ":8080"}
-	r.Add(worker.NewHTTPService(httpServer))
-
-	// Listen for errors in a separate goroutine
-	go func() {
-		for err := range r.Errors() {
-			log.Printf("Worker error: %v", err)
-		}
-	}()
-
-	// Start reactor in a separate goroutine
-	ctx := context.Background()
-	go func() {
-		if err := r.Start(ctx); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
-	// Do something useful...
-	time.Sleep(5 * time.Second)
-
-	// Gracefully shutdown the reactor with timeout
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	
-	if err := r.Shutdown(shutdownCtx); err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Reactor stopped")
-}
-```
-
-## 🔧 API Reference
-
-### Creating a Reactor 🏗️
-
-```go
-// Create a new reactor with default settings
-r, err := reactor.New()
-if err != nil {
-    log.Fatal(err)
-}
-
-// Create a reactor with custom options
-r, err := reactor.New(
-    reactor.WithLogger(customLogger),
-    reactor.WithErrorBufferSize(500),
-)
-if err != nil {
-    log.Fatal(err)
-}
-```
-
-### Adding Workers ➕
-
-```go
-// Add any worker that implements the Worker interface
-err := r.Add(myWorker)
-if err != nil {
-    log.Fatal(err) // Returns error if reactor already started
-}
-```
-
-### Starting and Stopping ▶️
-
-```go
-// Start all workers (blocks until all workers complete)
-ctx := context.Background()
-go func() {
-    if err := r.Start(ctx); err != nil {
+    file, err := os.Create("app.log")
+    if err != nil {
         log.Fatal(err)
     }
-}()
 
-// Listen for errors
-for err := range r.Errors() {
-    log.Printf("Error: %v", err)
-}
+    signals, err := trap.New(os.Interrupt)
+    if err != nil {
+        log.Fatal(err)
+    }
 
-// Shutdown all workers
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
+    work, err := runner.New(func(stop <-chan struct{}) error {
+        <-stop
+        return nil
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
 
-if err := r.Shutdown(shutdownCtx); err != nil {
-    log.Fatal(err)
+    shutdown, err := closer.New(file)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    app, err := reactor.New(signals, work, shutdown)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := app.Start(); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
-### `Worker` Interface 🔌
+## 📖 Core Components
 
-Any type implementing the Worker interface can be managed by the Reactor:
+### Worker Interface 📋
 
 ```go
 type Worker interface {
-	// Start begins the worker's operation with context.
-	// Must return an error immediately if startup fails.
-	// Runtime errors should be sent to the Errors() channel.
-	Start(ctx context.Context) error
-
-	// Shutdown gracefully stops the worker.
-	// Must return an error immediately if shutdown fails.
-	// Cleanup errors should be sent to the Errors() channel.
-	Shutdown(ctx context.Context) error
-
-	// Errors returns a read-only channel for error events.
-	// May return nil if the worker doesn't report errors.
-	// The channel must be closed when the worker stops.
-	Errors() <-chan error
+    Start() error
+    Stop()
 }
 ```
 
-### `Reactor` Type 🔄
+`Start` runs until the work finishes. `Stop` asks it to finish. A parent reactor calls `Start` once per `Start` and `Stop` once per `Stop`. The two calls may run at the same time, so an implementation has to allow `Stop` while `Start` is in progress.
 
-#### `New(options ...Option) (*Reactor, error)`
-Creates a new Reactor with optional configuration.
-- **Parameters**: functional options for customization
-- **Returns**: Reactor pointer or error
-- **Default error buffer size**: 1000 (range: 1-10000)
+The concrete reactor type stays inside the package. Callers receive `Worker`.
+
+### New 🏗️
 
 ```go
-r, err := reactor.New(
-    reactor.WithErrorBufferSize(500),
-    reactor.WithLogger(myLogger),
-)
+app, err := reactor.New(signals, work, shutdown)
 ```
 
-#### `Add(worker Worker) error`
-Registers a worker with the Reactor. Must be called before `Start()`.
-- **Restrictions**: cannot add workers after Start is called
-- **Returns**: `ErrNilWorker` if worker is nil, `ErrIsStarted` if reactor already running
-- **Thread-safe**: safe for concurrent calls before Start
+`New` copies the worker list. Later changes to the caller's slice leave the group unchanged. An empty list returns `ErrNoWorkers`. A nil worker returns `ErrNilWorker`. In both cases the returned worker is nil, and no worker has been started.
+
+Membership is fixed after `New`. Add another worker by building a new group, or by nesting groups.
+
+### Start ▶️
+
+`Start` runs every worker at the same time and returns the first result. That result may be nil when a worker finishes successfully before another worker returns an error. `Start` then calls `Stop` and waits until every worker has finished. Results that arrive after the first are discarded.
 
 ```go
-err := r.Add(worker1)
-err := r.Add(worker2)
+err := app.Start()
 ```
 
-#### `Start(ctx context.Context) error`
-Starts all registered workers in parallel and blocks until completion.
-- **Call count**: can only be called once per Reactor instance
-- **Blocking**: this is a blocking call; typically run in a goroutine
-- **Context**: propagated to all workers for lifecycle control
-- **Worker startup**: each worker starts in a separate goroutine
-- **Error collection**: errors from workers are collected into the Errors channel
-- **Channel closure**: Errors channel is closed when Start returns
-- **Returns**: error if reactor is already started, or if error buffer becomes full
+A panic in a worker's `Start` is recovered. `Stop` still runs, and the panic is raised again after the other workers have stopped. When more than one worker panics, one recovered value is raised. The raised panic takes the place of a returned error, including when another worker already finished with an error. A panic during the `Stop` that follows the first result is raised from that `Stop`, after the other `Stop` calls finish.
+
+`Start` blocks for the whole lifetime of the group. Call `Stop` from another goroutine when the group should end before a worker returns on its own. `trap` is the usual way to do that from an operating system signal.
+
+### Stop ⏹️
+
+`Stop` calls `Stop` on every worker at the same time and waits until every call returns. A later `Stop` calls every worker again. `runner`, `closer`, and `trap` ignore that second call. A custom worker chooses what a second `Stop` means.
 
 ```go
-ctx := context.Background()
-go func() {
-	if err := r.Start(ctx); err != nil {
-		log.Fatal(err)
-	}
-}()
+app.Stop()
 ```
 
-#### `Shutdown(ctx context.Context) error`
-Gracefully stops all workers.
-- **Prerequisite**: must call Start before Shutdown
-- **Concurrent shutdown**: each worker's Shutdown is called in a separate goroutine
-- **Context deadline**: propagated to workers for controlling shutdown duration
-- **Blocking behavior**: blocks until all workers shutdown, context is cancelled, or error buffer becomes full
-- **Returns**: error if reactor hasn't started, if already stopped, or if error buffer becomes full
+A panic in a worker's `Stop` is recovered. The other `Stop` calls still finish, and one recovered value is raised again.
+
+`Stop` before `Start` is safe. It stops every worker, and a later `Start` still runs them. Built-in workers then see that they are already stopped.
+
+## 🔌 Workers
+
+Each worker lives in its own package and exposes `New`. A nil argument returns a package-specific error and a nil worker. The concrete type stays in the package. Callers receive `reactor.Worker`.
+
+### Runner 🏃
+
+`runner` runs one function. `Start` calls it and returns its error. The first `Stop` closes the channel passed to the function and returns. The function must return after that channel is closed. A second `Stop` does nothing.
+
+`Stop` before `Start` is safe: the channel is already closed when the function begins.
+
+A nil function returns `ErrNilFunc`.
+
+Inside a group, a function that keeps running after the channel is closed keeps `Start` blocked. The group waits for every worker to finish after the first result.
+
+Typical uses:
+
+- Run a server or client loop until the group stops
+- Block until shutdown when the work has no other completion
+- Return the function error as the group's first result
 
 ```go
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
+import "github.com/yuppyweb/reactor/worker/runner"
 
-if err := r.Shutdown(shutdownCtx); err != nil {
-	log.Fatal(err)
-}
+work, err := runner.New(func(stop <-chan struct{}) error {
+    <-stop
+    return nil
+})
 ```
 
-#### `Errors() <-chan error`
-Returns a read-only channel for receiving all worker errors.
-- **Buffering**: when buffer is full, further error sends cause `Start()` or `Shutdown()` to return `ErrChannelFull`
-- **Channel closure**: automatically closed when Start returns
-- **Concurrency**: safe to read from multiple goroutines
-- **Reading pattern**: start reading from this channel in a concurrent goroutine before calling `Start()`, so errors are captured as they occur. The channel closes when `Start()` completes
+### Closer 🔒
+
+`closer` keeps an `io.Closer` open until `Stop`. `Start` blocks until `Stop`. The first `Stop` closes the resource once, stores the error from `Close`, and unblocks `Start` with that error. A second `Stop` does nothing.
+
+`Stop` before `Start` is safe. `Start` then returns the stored close error.
+
+A nil resource returns `ErrNilCloser`.
+
+Inside a group, that close error is the value `Start` returns when the closer finishes first. When another worker finishes first, the close error is discarded with every other later result. The resource is still closed once.
+
+Typical uses:
+
+- Close a listener, file, or connection pool when the group stops
+- Keep a resource open for the life of `Start`
+- Report `Close` when this worker is the one that finishes first
 
 ```go
-go func() {
-	for err := range r.Errors() {
-		log.Printf("Worker error: %v", err)
-	}
-}()
+import "github.com/yuppyweb/reactor/worker/closer"
+
+shutdown, err := closer.New(listener)
 ```
 
-## ⚙️ Configuration Options
+### Trap 📡
 
-### `WithLogger(logger Logger)`
-Sets a custom logger for debug and error message logging.
-- **Default**: `NopLogger` (discards all messages)
-- **Error**: returns `ErrNilLogger` if logger is nil
+`trap` waits until one configured signal arrives or `Stop` is called. Both outcomes return nil, so a trap alone does not fail the group. `signal.Stop` runs when `Start` returns, and the process stops delivering those signals to this worker.
 
-```go
-r, err := reactor.New(reactor.WithLogger(myLogger))
-```
+The signal list is copied. Later changes to the caller's slice leave the trap unchanged. An empty list returns `ErrNoSignals`. A nil signal returns `ErrNilSignal`. The handler is installed in `Start`.
 
-### `WithErrorBufferSize(size int)`
-Configures the error channel buffer size.
-- **Valid range**: 1 to 10000
-- **Default**: 1000
-- **Error**: returns `ErrMinErrorBufferSize` or `ErrMaxErrorBufferSize` if out of range
+The first `Stop` unblocks `Start`. A second `Stop` does nothing. `Stop` before `Start` is safe: `Start` returns nil.
 
-```go
-r, err := reactor.New(reactor.WithErrorBufferSize(500))
-```
+Typical uses:
 
-## 📋 Logger Interface
-
-Implement custom logging by implementing the Logger interface:
-
-```go
-type Logger interface {
-	// Debug logs debug-level messages
-	Debug(ctx context.Context, msg string, args ...any)
-	
-	// Error logs error-level messages
-	Error(ctx context.Context, err error, args ...any)
-}
-```
-
-### Built-in: `NopLogger` 🚫
-A no-operation logger that discards all messages.
-
-```go
-logger := reactor.NewNopLogger()
-```
-
-### Recommended Logger: `Cakelog` 🍰
-
-For structured logging in production, consider using [**Cakelog**](https://github.com/yuppyweb/cakelog) — a flexible and efficient logger that implements the Reactor Logger interface:
+- End the process on interrupt
+- Unblock a group when the operating system asks it to stop
+- Finish the group with nil when the signal is the first result
 
 ```go
 import (
-	"context"
-	"log/slog"
-	"os"
-	"github.com/yuppyweb/cakelog/adapter"
-	"github.com/yuppyweb/reactor"
+    "os"
+
+    "github.com/yuppyweb/reactor/worker/trap"
 )
 
-func main() {
-	// Create Slog logger with JSON output
-	slogLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	
-	// Create Cakelog adapter
-	logger := adapter.NewSlogLogger(slogLogger)
-	
-	// Use with Reactor
-	r, err := reactor.New(reactor.WithLogger(logger))
-	if err != nil {
-		panic(err)
-	}
-	
-	r.Start(context.Background())
-}
+signals, err := trap.New(os.Interrupt)
 ```
 
-Cakelog provides:
-- ✅ Unified interface for multiple logging backends (Logrus, Slog, Zap, Zerolog)
-- ✅ Structured logging with context support
-- ✅ Decorators for adding features
-- ✅ Production-ready performance and flexibility
+## 📝 Examples
 
-Visit [yuppyweb/cakelog](https://github.com/yuppyweb/cakelog) for more information.
+### Custom Worker 🛠️
 
-## 🚀 Built-in Workers
-
-### `HTTPService` 🌐
-
-Manages the lifecycle of an `http.Server`:
+`Start` and `Stop` may run at the same time. This worker closes its channel once, so a second `Stop` from the parent reactor is safe.
 
 ```go
-import (
-	"net/http"
-	"github.com/yuppyweb/reactor/worker"
-)
+import "sync"
 
-server := &http.Server{
-	Addr:    ":8080",
-	Handler: mux,
+type gate struct {
+    stop chan struct{}
+    once sync.Once
 }
 
-httpWorker := worker.NewHTTPService(server)
-r.Add(httpWorker)
+func newGate() *gate {
+    return &gate{stop: make(chan struct{})}
+}
+
+func (g *gate) Start() error {
+    <-g.stop
+    return nil
+}
+
+func (g *gate) Stop() {
+    g.once.Do(func() {
+        close(g.stop)
+    })
+}
 ```
-
-- **Start**: calls `ListenAndServe()`  
-- **Shutdown**: calls `Shutdown(ctx)` with context
-- **Errors**: returns nil (HTTP errors are not reported)
-
-### `GRPCService` 📡
-
-Manages the lifecycle of a gRPC server:
 
 ```go
-import (
-	"net"
-	"google.golang.org/grpc"
-	"github.com/yuppyweb/reactor/worker"
-)
-
-lis, _ := net.Listen("tcp", ":5000")
-grpcServer := grpc.NewServer()
-gpc.RegisterMyServiceServer(grpcServer, myServiceImpl)
-
-grpcWorker := worker.NewGRPCService(grpcServer, lis)
-r.Add(grpcWorker)
+worker := newGate()
+app, err := reactor.New(worker)
 ```
 
-- **Start**: calls `Serve(listener)`
-- **Shutdown**: calls `GracefulStop()`
-- **Errors**: returns nil (gRPC errors are not reported)
+### Nested Reactors 🧩
 
-### Custom Workers 🛠️
-
-Create your own worker by implementing the Worker interface:
+Stopping the outer reactor stops the inner groups. Each inner `Stop` stops that group's workers.
 
 ```go
-type CustomWorker struct {
-	errCh chan error
+// httpWorker, metricsWorker, dbWorker, and cacheWorker implement reactor.Worker.
+// signals is the trap from above.
+
+api, err := reactor.New(httpWorker, metricsWorker)
+if err != nil {
+    log.Fatal(err)
 }
 
-func (w *CustomWorker) Start(ctx context.Context) error {
-	go func() {
-		defer close(w.errCh)
-		// Worker logic here
-		// Send errors to w.errCh
-	}()
-	return nil
+data, err := reactor.New(dbWorker, cacheWorker)
+if err != nil {
+    log.Fatal(err)
 }
 
-func (w *CustomWorker) Shutdown(ctx context.Context) error {
-	// Cleanup logic
-	return nil
+app, err := reactor.New(signals, api, data)
+if err != nil {
+    log.Fatal(err)
 }
 
-func (w *CustomWorker) Errors() <-chan error {
-	return w.errCh
+if err := app.Start(); err != nil {
+    log.Fatal(err)
 }
-
-// Use it
-r.Add(&CustomWorker{errCh: make(chan error)})
 ```
 
-## 📚 Usage Examples
+### Signal, Serve, and Close 🌐
 
-### Example 1: HTTP + gRPC Services 💻
+The trap, the serve loop, and the listener run as one group. `http.Serve` returns when the closer closes the listener. The runner returns after `stop` is closed, once `Serve` has returned.
+
+`Start` returns the first result. An interrupt finishes the trap with nil, so `Start` returns nil and a later close error is discarded. A serve error that finishes first is the value `Start` returns. The listener is closed either way.
 
 ```go
 package main
 
 import (
-	"context"
-	"log"
-	"net"
-	"net/http"
-	"time"
+    "errors"
+    "log"
+    "net"
+    "net/http"
+    "os"
 
-	"google.golang.org/grpc"
-	"github.com/yuppyweb/reactor"
-	"github.com/yuppyweb/reactor/worker"
+    "github.com/yuppyweb/reactor"
+    "github.com/yuppyweb/reactor/worker/closer"
+    "github.com/yuppyweb/reactor/worker/runner"
+    "github.com/yuppyweb/reactor/worker/trap"
 )
 
 func main() {
-	// Create reactor
-	r, err := reactor.New(reactor.WithErrorBufferSize(500))
-	if err != nil {
-		log.Fatal(err)
-	}
+    listener, err := net.Listen("tcp", ":8080")
+    if err != nil {
+        log.Fatal(err)
+    }
 
-	// Add HTTP service
-	httpServer := &http.Server{Addr: ":8080"}
-	r.Add(worker.NewHTTPService(httpServer))
+    signals, err := trap.New(os.Interrupt)
+    if err != nil {
+        log.Fatal(err)
+    }
 
-	// Add gRPC service
-	listener, _ := net.Listen("tcp", ":5000")
-	grpcServer := grpc.NewServer()
-	r.Add(worker.NewGRPCService(grpcServer, listener))
+    serve, err := runner.New(func(stop <-chan struct{}) error {
+        errCh := make(chan error, 1)
 
-	// Listen for errors
-	go func() {
-		for err := range r.Errors() {
-			log.Printf("Service error: %v", err)
-		}
-	}()
+        go func() {
+            errCh <- http.Serve(listener, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+        }()
 
-	// Start services
-	ctx := context.Background()
-	go r.Start(ctx)
+        select {
+        case <-stop:
+            <-errCh
+            return nil
+        case err := <-errCh:
+            if errors.Is(err, net.ErrClosed) {
+                return nil
+            }
 
-	// Wait for interrupt and shutdown gracefully
-	select {}
-	
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	r.Shutdown(shutdownCtx)
+            return err
+        }
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    shutdown, err := closer.New(listener)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    app, err := reactor.New(signals, serve, shutdown)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if err := app.Start(); err != nil {
+        log.Fatal(err)
+    }
 }
-```
-
-### Example 2: Custom Worker 🗂️
-
-```go
-type DatabasePool struct {
-	errCh chan error
-}
-
-func (p *DatabasePool) Start(ctx context.Context) error {
-	go func() {
-		defer close(p.errCh)
-		// Initialize connection pool
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			// Handle database work
-			}
-		}
-	}()
-	return nil
-}
-
-func (p *DatabasePool) Shutdown(ctx context.Context) error {
-	// Close connections gracefully
-	return nil
-}
-
-func (p *DatabasePool) Errors() <-chan error {
-	return p.errCh
-}
-
-// Add to reactor
-r.Add(&DatabasePool{errCh: make(chan error)})
-```
-
-### Example 3: Nested Reactors 🧩
-
-```go
-// Create service-specific reactors
-apiReactor, _ := reactor.New()
-apiReactor.Add(httpWorker)
-apiReactor.Add(metricsWorker)
-
-// Create data-layer reactor
-dataReactor, _ := reactor.New()
-dataReactor.Add(dbWorker)
-dataReactor.Add(cacheWorker)
-
-// Combine in main reactor
-main, _ := reactor.New()
-main.Add(apiReactor)
-main.Add(dataReactor)
-
-// Start and shutdown as single unit
-go main.Start(context.Background())
-main.Shutdown(shutdownCtx)
-```
-
-## ⚠️ Error Handling
-
-The Reactor defines the following error types:
-
-| Error | Meaning |
-|-------|---------|
-| `ErrNilOption` | An option passed to `New()` is nil |
-| `ErrNilLogger` | Logger passed to `WithLogger()` is nil |
-| `ErrMinErrorBufferSize` | Buffer size less than 1 |
-| `ErrMaxErrorBufferSize` | Buffer size greater than 10000 |
-| `ErrNilWorker` | Worker passed to `Add()` is nil |
-| `ErrNoWorkers` | `Start()` called with no workers added |
-| `ErrNotRestart` | `Start()` called more than once |
-| `ErrIsStarted` | `Add()` called after `Start()` |
-| `ErrNotStarted` | `Shutdown()` called before `Start()` |
-| `ErrIsStopped` | `Add()` called after reactor is stopped |
-| `ErrChannelFull` | Error channel buffer is full; `Start()` or `Shutdown()` unable to send errors |
-
-### Best Practices 💡
-
-- **Always read errors concurrently**: Start reading from `Errors()` in a goroutine before calling `Start()`
-- **Add workers before starting**: Call `Add()` for all workers before calling `Start()`
-- **Use context deadlines**: Set a reasonable timeout with `context.WithTimeout()` for `Shutdown()`
-- **Handle channel fullness**: Monitor for `ErrChannelFull` to detect if error buffer is too small
-- **Close error channels**: Worker implementations must close their error channels when done
-
-```go
-// Good: read errors concurrently
-go func() {
-	for err := range r.Errors() {
-		log.Printf("Error: %v", err)
-	}
-}()
-
-r.Start(ctx)
 ```
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome. Please open a pull request.
 
 ## 📄 License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-For more information about the MIT License, visit [opensource.org/licenses/MIT](https://opensource.org/licenses/MIT).

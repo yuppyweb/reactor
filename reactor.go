@@ -1,342 +1,146 @@
-// Package reactor provides a lifecycle coordination framework for managing
-// multiple concurrent workers. It allows workers to be started and gracefully
-// shut down together while collecting errors from all workers into a single channel.
+// Package reactor coordinates the lifecycle of concurrent workers.
 //
-// The Reactor type coordinates the lifecycle of multiple Worker implementations,
-// ensuring that all workers start and stop in a controlled manner with proper
-// context propagation and error handling.
+// New groups workers that implement Worker. Start runs every worker and
+// returns the first result. It then stops the group and waits until the
+// remaining workers finish. Later results are discarded. Stop stops every
+// worker. A panic in Start or Stop is recovered and raised again after the
+// other workers have been stopped.
 //
-// Example:
-//
-//	type MyWorker struct {}
-//
-//	func (w *MyWorker) Start(ctx context.Context) error {
-//		// Worker logic here
-//		return nil
-//	}
-//
-//	func (w *MyWorker) Shutdown(ctx context.Context) error {
-//		// Cleanup logic here
-//		return nil
-//	}
-//
-//	func (w *MyWorker) Errors() <-chan error {
-//		// Return error channel
-//		return make(chan error)
-//	}
-//
-//	reactor, err := reactor.New()
-//	if err != nil {
-//		// Handle error
-//	}
-//
-//	if err := reactor.Add(&MyWorker{}); err != nil {
-//		// Handle error
-//	}
-//
-//	errCh := reactor.Errors()
-//	go func() {
-//		for err := range errCh {
-//			// Handle error
-//		}
-//	}()
-//
-//	if err := reactor.Start(ctx); err != nil {
-//		// Handle error
-//	}
+// Reactor implements Worker, so one reactor can be a worker of another.
 package reactor
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"sync"
-	"sync/atomic"
-)
-
-const (
-	packageName = "reactor"
-
-	// defaultErrorBufferSize is the default size of the error channel buffer for Reactor.
-	defaultErrorBufferSize = 1000
 )
 
 var (
-	ErrNilOption    = errors.New(packageName + ": option cannot be nil")
-	ErrNilWorker    = errors.New(packageName + ": worker is nil")
-	ErrNoWorkers    = errors.New(packageName + ": no workers added to reactor")
-	ErrNotRestart   = errors.New(packageName + ": restart is not possible")
-	ErrIsStarted    = errors.New(packageName + ": is already started")
-	ErrNotStarted   = errors.New(packageName + ": is not started")
-	ErrIsStopped    = errors.New(packageName + ": is stopped")
-	ErrChannelFull  = errors.New(packageName + ": error channel is full")
-	ErrFailedToSend = errors.New(packageName + ": failed to send error")
+	// ErrNoWorkers is returned by New when no workers are provided.
+	ErrNoWorkers = errors.New("no workers provided")
+
+	// ErrNilWorker is returned by New when a worker is nil.
+	ErrNilWorker = errors.New("worker is nil")
 )
 
-// Worker defines the lifecycle interface for a service component.
-// Implementations must handle starting, shutting down, and reporting errors
-// in a concurrent-safe manner.
+// Worker is one unit of work with a start and a stop.
 //
-// Start begins the operation asynchronously and returns an error immediately if startup fails.
-// Any runtime errors should be sent to the Errors() channel.
-// Shutdown gracefully stops the worker and returns an error immediately if shutdown fails.
-// Any errors during shutdown should also be sent to the Errors() channel.
-// Errors returns a buffered channel for error events; the channel must be closed
-// when the worker stops, and implementations must support concurrent reads.
+// Start runs until the work finishes. Stop asks it to finish. Reactor
+// calls Start once per Start and Stop once per Stop. The two calls may
+// run at the same time. Reactor recovers a panic in either method and
+// raises it again after the other workers are stopped.
 type Worker interface {
-	// Start begins the worker's operation with the given context.
-	// The implementation should respect context cancellation and deadlines.
-	// An error is returned immediately if startup cannot begin (e.g., already started).
-	// Runtime errors should be sent to the Errors() channel.
-	Start(ctx context.Context) error
+	// Start runs the worker and returns when it finishes.
+	Start() error
 
-	// Shutdown gracefully stops the worker using the given context.
-	// Implementations may be asynchronous and can launch shutdown in a separate goroutine.
-	// The context deadline should be respected for cleanup operations.
-	// Any errors during shutdown should be sent to the Errors() channel.
-	Shutdown(ctx context.Context) error
-
-	// Errors returns a read-only channel for error events from the worker.
-	// May return nil if the worker does not report errors.
-	// If a non-nil channel is returned, it should be closed when the worker stops.
-	// Implementations must ensure the channel is safe for concurrent reads.
-	Errors() <-chan error
+	// Stop asks the worker to finish.
+	Stop()
 }
 
-// Option is a functional option type for configuring Reactor instances.
-// Options are passed to the New function to customize Reactor behavior.
-type Option func(*Reactor) error
-
-// Reactor coordinates the lifecycle of multiple workers.
-// It ensures all workers start and shut down in a controlled manner, collecting
-// errors from all workers into a single channel for unified error handling.
+// reactor runs a fixed list of workers together.
 //
-// Reactor is safe for concurrent use and itself implements the Worker interface.
-// The Start method can only be called once and blocks until all workers have
-// started and completed (stopped). The Shutdown method must be called after Start
-// and blocks until all workers have gracefully shut down. Both methods coordinate
-// proper error collection and reporting.
-type Reactor struct {
-	workers   []Worker
-	isStarted atomic.Bool
-	isStopped atomic.Bool
-	isSending atomic.Bool
-	errCh     chan error
-	errFullCh chan struct{}
-	mu        sync.Mutex
-	log       Logger
+// workers is the copy taken by New. Later changes to the caller's slice
+// do not change it.
+type reactor struct {
+	// workers is the copied list passed to New, in the same order.
+	workers []Worker
 }
 
-// New creates a new Reactor with no initial workers.
-// Workers can be added later using the Add method.
-func New(options ...Option) (*Reactor, error) {
-	reactor := new(Reactor)
-	reactor.workers = make([]Worker, 0)
-	reactor.errCh = make(chan error, defaultErrorBufferSize)
-	reactor.errFullCh = make(chan struct{})
-	reactor.log = NewNopLogger()
+// New returns a worker that runs every given worker together.
+//
+// The workers slice is copied. Later changes to the caller's slice do
+// not affect the reactor. The concrete type is not exported. Callers
+// receive Worker, and a reactor can itself be a worker of another
+// reactor.
+//
+// An empty list returns ErrNoWorkers. A nil worker returns ErrNilWorker.
+// No worker is started.
+func New(workers ...Worker) (Worker, error) {
+	if len(workers) == 0 {
+		return nil, ErrNoWorkers
+	}
 
-	for _, option := range options {
-		if option == nil {
-			return nil, ErrNilOption
+	copied := make([]Worker, 0, len(workers))
+
+	for _, worker := range workers {
+		if worker == nil {
+			return nil, ErrNilWorker
 		}
 
-		if err := option(reactor); err != nil {
-			return nil, err
-		}
+		copied = append(copied, worker)
 	}
 
-	return reactor, nil
+	return &reactor{workers: copied}, nil
 }
 
-// Add registers a new worker with the Reactor.
-// Workers must be added before the Reactor is started; adding workers after Start returns ErrIsStarted.
-// Adding a nil worker returns ErrNilWorker. Adding workers after the Reactor is stopped returns ErrIsStopped.
-func (r *Reactor) Add(worker Worker) error {
-	if worker == nil {
-		return ErrNilWorker
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.isStopped.Load() {
-		return ErrIsStopped
-	}
-
-	if r.isStarted.Load() {
-		return ErrIsStarted
-	}
-
-	r.workers = append(r.workers, worker)
-
-	return nil
-}
-
-// Start begins execution of all workers concurrently.
-// It starts each worker in a separate goroutine and collects errors from all workers
-// into the error channel. Start can be called only once per Reactor instance;
-// subsequent calls return ErrNotRestart.
+// Start runs every worker at the same time and returns the first result.
+// It then calls Stop and waits until every worker has finished. Results
+// that arrive after the first are discarded.
 //
-// The context parameter is propagated to all workers and controls the lifetime
-// of the worker startup sequence. If the context is cancelled, no guarantee is made
-// about which workers have started.
-//
-// This method blocks until all workers have started and completed (stopped reporting errors).
-// This includes waiting for all error reporting goroutines to finish reading from worker
-// error channels, which only happens when workers close their error channels (typically
-// upon shutdown). The error channel is closed when this method returns.
-//
-// If the error channel buffer becomes full, no more errors can be sent and Start will
-// return ErrChannelFull instead of blocking goroutines. The caller is responsible for
-// reading errors concurrently and ensuring sufficient error channel buffer capacity.
-func (r *Reactor) Start(ctx context.Context) error {
-	if len(r.workers) == 0 {
-		return ErrNoWorkers
-	}
-
-	if !r.isStarted.CompareAndSwap(false, true) {
-		return ErrNotRestart
-	}
-
-	defer r.stop()
-
-	r.isSending.Store(true)
-
-	wg := sync.WaitGroup{}
-	done := make(chan struct{})
+// A panic in a worker's Start is recovered. Stop still runs, and the
+// panic is raised again instead of being returned. If more than one
+// worker panics, one recovered value is raised. A panic in Stop is also
+// raised again, from the Stop call, after the other Stop calls finish.
+func (r *reactor) Start() error {
+	errCh := make(chan error, len(r.workers))
+	panicCh := make(chan any, len(r.workers))
 
 	for _, worker := range r.workers {
-		wg.Go(func() {
-			r.log.Debug(ctx, packageName+": starting worker", LogArgs{"worker": worker})
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					panicCh <- rec
 
-			if err := worker.Start(ctx); err != nil {
-				r.sendError(ctx, err)
-			}
-		})
+					errCh <- nil
+				}
+			}()
 
-		errCh := worker.Errors()
-
-		// If the worker does not report errors, we skip it.
-		if errCh == nil {
-			continue
-		}
-
-		wg.Go(func() {
-			for err := range errCh {
-				r.sendError(ctx, err)
-			}
-		})
+			errCh <- worker.Start()
+		}()
 	}
 
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+	err := <-errCh
 
-	select {
-	case <-done:
-		r.log.Debug(ctx, packageName+": all workers completed")
+	r.Stop()
 
-	case <-ctx.Done():
-		r.log.Debug(ctx, packageName+": workers startup cancelled by context")
-
-	case <-r.errFullCh:
-		return ErrChannelFull
-	}
-
-	return nil
-}
-
-// Shutdown gracefully stops all workers with the given context.
-// Each worker's Shutdown is launched in a separate goroutine with the provided context.
-// The method blocks until all workers have completed their shutdown, the context is
-// cancelled, or an error occurs (such as ErrChannelFull if the error buffer becomes full).
-// The context parameter is propagated to all workers to control their shutdown deadline.
-func (r *Reactor) Shutdown(ctx context.Context) error {
-	if !r.isStarted.Load() {
-		return ErrNotStarted
-	}
-
-	if r.isStopped.Load() {
-		return ErrIsStopped
-	}
-
-	wg := sync.WaitGroup{}
-	done := make(chan struct{})
-
-	for _, worker := range r.workers {
-		wg.Go(func() {
-			r.log.Debug(ctx, packageName+": shutting down worker", LogArgs{"worker": worker})
-
-			if err := worker.Shutdown(ctx); err != nil {
-				r.sendError(ctx, err)
-			}
-		})
-	}
-
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		r.log.Debug(ctx, packageName+": all workers shut down")
-
-	case <-ctx.Done():
-		r.log.Debug(ctx, packageName+": workers shutdown cancelled by context")
-
-	case <-r.errFullCh:
-		return ErrChannelFull
-	}
-
-	return nil
-}
-
-// Errors returns a channel for receiving errors from all workers.
-// The channel is closed when Start returns.
-//
-// The channel should be read concurrently with Start to receive all errors
-// before the channel is closed. If the error channel buffer becomes full,
-// ErrChannelFull is returned by Start or Shutdown instead of blocking goroutines,
-// and the channel will be closed when Start returns.
-func (r *Reactor) Errors() <-chan error {
-	return r.errCh
-}
-
-// sendError safely sends an error to the error channel.
-// If the reactor is stopped, the error is silently dropped.
-// If the error channel is full, ErrChannelFull is sent to errDoneCh instead.
-// This method is protected by a mutex to ensure thread-safe access to the channels.
-func (r *Reactor) sendError(ctx context.Context, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if !r.isSending.Load() {
-		return
+	for i := 1; i < cap(errCh); i++ {
+		<-errCh
 	}
 
 	select {
-	case r.errCh <- err:
+	case rec := <-panicCh:
+		panic(rec)
 	default:
-		r.isSending.Store(false)
-		close(r.errFullCh)
+	}
 
-		r.log.Error(ctx, fmt.Errorf("%w: %w", ErrFailedToSend, err))
+	return err
+}
+
+// Stop calls Stop on every worker at the same time and waits until every
+// call returns. A later Stop calls every worker again.
+//
+// A panic in a worker's Stop is recovered. The other Stop calls still
+// finish, and one recovered value is raised again.
+func (r *reactor) Stop() {
+	wg := sync.WaitGroup{}
+	panicCh := make(chan any, len(r.workers))
+
+	for _, worker := range r.workers {
+		wg.Go(func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					panicCh <- rec
+				}
+			}()
+
+			worker.Stop()
+		})
+	}
+
+	wg.Wait()
+
+	select {
+	case rec := <-panicCh:
+		panic(rec)
+	default:
 	}
 }
-
-// stop marks the reactor as stopped, stops error sending, and closes the error channel.
-// This method is protected by a mutex to ensure thread-safe access to the channels.
-func (r *Reactor) stop() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.isStopped.Store(true)
-	r.isSending.Store(false)
-	close(r.errCh)
-}
-
-// Ensure Reactor implements the Worker interface.
-var _ Worker = (*Reactor)(nil)

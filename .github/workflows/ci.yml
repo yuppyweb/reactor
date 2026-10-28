@@ -1,0 +1,93 @@
+# PR and tag pipeline: tests, linters, vulnerability scan, and flaky tests run in parallel.
+# GitHub does not block merging from a workflow file alone. After the first run,
+# add a ruleset (Settings → Rules → Rulesets) or branch protection on the target
+# branch and require the "Required" check. That job fails if any sibling job fails.
+name: CI
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "**"
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: |
+          go test --count=1 -race -v -coverprofile=cover.out ./...
+          go tool cover -func=cover.out
+
+  lint:
+    name: Linters
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          args: --timeout=10m --color=always
+
+  vuln:
+    name: Vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: govulncheck
+        run: go tool govulncheck -show=color -test ./...
+
+  flaky:
+    name: Flaky tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests 1000 times
+        run: go test --count=1000 -failfast ./...
+
+  required:
+    name: Required
+    if: always()
+    needs: [test, lint, vuln, flaky]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Verify all jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          echo "Job results: ${RESULTS}"
+          case "${RESULTS}" in
+            success,success,success,success) exit 0 ;;
+            *) echo "A required job did not succeed"; exit 1 ;;
+          esac
