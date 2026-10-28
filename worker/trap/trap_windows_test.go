@@ -17,8 +17,20 @@ import (
 	"github.com/yuppyweb/reactor/worker/trap"
 )
 
-// signalHelperVar selects the child process that waits for os.Interrupt.
-const signalHelperVar = "REACTOR_TRAP_SIGNAL_HELPER"
+const (
+	// signalHelperVar selects the child process that waits for os.Interrupt.
+	signalHelperVar = "REACTOR_TRAP_SIGNAL_HELPER"
+
+	// helperTimeout bounds each stage of the helper. Windows runners with
+	// the race detector can take well over a second to deliver an event.
+	helperTimeout = 10 * time.Second
+
+	// readyLine is printed by the helper once it handles os.Interrupt.
+	readyLine = "ready\n"
+
+	// doneLine is printed by the helper after trap.Start returns.
+	doneLine = "done\n"
+)
 
 // lockedBuffer is a bytes.Buffer that is safe to write from the exec
 // copy goroutine while the test reads it.
@@ -48,6 +60,22 @@ func (lb *lockedBuffer) String() string {
 	return lb.buf.String()
 }
 
+// signalHelper is a running helper process.
+type signalHelper struct {
+	// cmd is the helper process.
+	cmd *exec.Cmd
+
+	// stderr collects the helper's error output.
+	stderr *lockedBuffer
+
+	// done receives the line printed after ready, or "" when stdout
+	// closes first.
+	done <-chan string
+
+	// exited is closed after the helper process has exited.
+	exited <-chan struct{}
+}
+
 // TestMain runs the signal helper when signalHelperVar is set.
 // Otherwise it runs the tests.
 func TestMain(m *testing.M) {
@@ -68,17 +96,18 @@ func TestMain(m *testing.M) {
 func TestStartReturnsOnSignal(t *testing.T) {
 	t.Parallel()
 
-	cmd, stderr, exited := startSignalHelper(t)
+	helper := startSignalHelper(t)
 
 	// Repeat the event. The first CTRL_BREAK can arrive after ready is
-	// written and before Start calls signal.Notify. The handler installed
-	// before ready keeps that event from terminating the process.
-	signalUntilExit(t, cmd, stderr, exited)
+	// written and before Start calls signal.Notify. Sending stops once the
+	// helper reports done, so no event arrives while the process exits.
+	signalUntilDone(t, helper)
+	requireHelperSuccess(t, helper)
 }
 
 // startSignalHelper starts the helper process and waits until it prints
 // ready.
-func startSignalHelper(t *testing.T) (*exec.Cmd, *lockedBuffer, <-chan struct{}) {
+func startSignalHelper(t *testing.T) *signalHelper {
 	t.Helper()
 
 	//nolint:gosec // The executable is this test binary.
@@ -102,12 +131,17 @@ func startSignalHelper(t *testing.T) (*exec.Cmd, *lockedBuffer, <-chan struct{})
 		t.Fatalf("start helper: %v", err)
 	}
 
-	// Wait closes stdout, so the ready line is read before Wait starts.
-	ready, readErr := bufio.NewReader(stdout).ReadString('\n')
+	reader := bufio.NewReader(stdout)
+	ready, readErr := reader.ReadString('\n')
 
+	done := make(chan string, 1)
 	exited := make(chan struct{})
 
 	go func() {
+		// Wait closes stdout, so every read finishes before Wait starts.
+		line, _ := reader.ReadString('\n')
+		done <- line
+
 		_ = cmd.Wait()
 
 		close(exited)
@@ -123,29 +157,34 @@ func startSignalHelper(t *testing.T) (*exec.Cmd, *lockedBuffer, <-chan struct{})
 		t.Fatalf("read ready: %v: %s", readErr, stderr.String())
 	}
 
-	if ready != "ready\n" {
+	if ready != readyLine {
 		t.Fatalf("helper: %q: %s", ready, stderr.String())
 	}
 
-	return cmd, stderr, exited
+	return &signalHelper{
+		cmd:    cmd,
+		stderr: stderr,
+		done:   done,
+		exited: exited,
+	}
 }
 
-// signalUntilExit sends CTRL_BREAK until the helper process exits.
-func signalUntilExit(t *testing.T, cmd *exec.Cmd, stderr *lockedBuffer, exited <-chan struct{}) {
+// signalUntilDone sends CTRL_BREAK until the helper prints done.
+func signalUntilDone(t *testing.T, helper *signalHelper) {
 	t.Helper()
 
-	deadline := time.NewTimer(time.Second)
+	deadline := time.NewTimer(helperTimeout)
 	defer deadline.Stop()
 
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		sendErr := sendCtrlBreak(cmd.Process.Pid)
+		sendErr := sendCtrlBreak(helper.cmd.Process.Pid)
 
 		select {
-		case <-exited:
-			requireHelperSuccess(t, cmd, stderr)
+		case line := <-helper.done:
+			requireDoneLine(t, helper, line)
 
 			return
 		default:
@@ -156,24 +195,52 @@ func signalUntilExit(t *testing.T, cmd *exec.Cmd, stderr *lockedBuffer, exited <
 		}
 
 		select {
-		case <-exited:
-			requireHelperSuccess(t, cmd, stderr)
+		case line := <-helper.done:
+			requireDoneLine(t, helper, line)
 
 			return
 		case <-ticker.C:
 		case <-deadline.C:
-			t.Fatalf("start did not return on signal: %s", stderr.String())
+			t.Fatalf("start did not return on signal: %s", helper.stderr.String())
 		}
+	}
+}
+
+// requireDoneLine fails the test unless line is the done line. On
+// failure it waits for the helper to exit to report its status.
+func requireDoneLine(t *testing.T, helper *signalHelper, line string) {
+	t.Helper()
+
+	if line == doneLine {
+		return
+	}
+
+	select {
+	case <-helper.exited:
+		t.Fatalf(
+			"helper stopped before done: %q: %v: %s",
+			line,
+			helper.cmd.ProcessState,
+			helper.stderr.String(),
+		)
+	case <-time.After(helperTimeout):
+		t.Fatalf("helper stopped before done: %q: %s", line, helper.stderr.String())
 	}
 }
 
 // requireHelperSuccess fails the test unless the helper exits with
 // status 0.
-func requireHelperSuccess(t *testing.T, cmd *exec.Cmd, stderr *lockedBuffer) {
+func requireHelperSuccess(t *testing.T, helper *signalHelper) {
 	t.Helper()
 
-	if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 0 {
-		t.Fatalf("helper: %v: %s", cmd.ProcessState, stderr.String())
+	select {
+	case <-helper.exited:
+	case <-time.After(helperTimeout):
+		t.Fatalf("helper did not exit after done: %s", helper.stderr.String())
+	}
+
+	if helper.cmd.ProcessState == nil || helper.cmd.ProcessState.ExitCode() != 0 {
+		t.Fatalf("helper: %v: %s", helper.cmd.ProcessState, helper.stderr.String())
 	}
 }
 
@@ -191,17 +258,16 @@ func sendCtrlBreak(pid int) error {
 }
 
 // waitForInterrupt is the helper process. It notifies for os.Interrupt,
-// prints ready, and returns when trap.Start returns.
+// prints ready, and prints done when trap.Start returns.
 func waitForInterrupt() error {
 	// Notify before Start so an early CTRL_BREAK is delivered here and does
-	// not run the default terminate action. The channel is never stopped:
-	// the test keeps sending CTRL_BREAK until the process exits, and an
-	// event after signal.Stop would end it with STATUS_CONTROL_C_EXIT.
+	// not run the default terminate action. The channel is never stopped,
+	// so an event that arrives after done is still handled here.
 	ready := make(chan os.Signal, 1)
 
 	signal.Notify(ready, os.Interrupt)
 
-	if _, err := os.Stdout.WriteString("ready\n"); err != nil {
+	if _, err := os.Stdout.WriteString(readyLine); err != nil {
 		return fmt.Errorf("write ready: %w", err)
 	}
 
@@ -212,6 +278,10 @@ func waitForInterrupt() error {
 
 	if err = worker.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
+	}
+
+	if _, err = os.Stdout.WriteString(doneLine); err != nil {
+		return fmt.Errorf("write done: %w", err)
 	}
 
 	return nil
