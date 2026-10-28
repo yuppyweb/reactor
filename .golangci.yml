@@ -117,6 +117,13 @@ linters:
           deny:
             - pkg: github.com/pkg/errors
               desc: Should be replaced by standard lib errors package
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - github.com/yuppyweb/reactor.Worker
     varnamelen:
       min-name-length: 2
   exclusions:
@@ -128,12 +135,8 @@ linters:
       - std-error-handling
     rules:
       - linters:
-          - dupl
           - err113
-          - cyclop
           - funlen
-          - containedctx
-          - gocognit
         path: _test.go
     paths:
       - third_party
